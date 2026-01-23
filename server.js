@@ -3,6 +3,7 @@
  * Reverse proxy por PATH:
  * - /shop/*  -> pos360-commerce-frontend (nginx)
  * - /api/*   -> pos360-commerce-api (express)
+ * - /app/*   -> alias público de /shop/* (SIN srv-captain)
  */
 
 const express = require("express");
@@ -12,19 +13,43 @@ const app = express();
 
 function env(name, fallback) {
   const v = process.env[name];
-  return v !== undefined && v !== null && String(v).trim() !== "" ? String(v).trim() : fallback;
+  return v !== undefined && v !== null && String(v).trim() !== ""
+    ? String(v).trim()
+    : fallback;
 }
 
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 
-// ✅ Nombres reales (CapRover)
-const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-commerce-frontend");
-const API_UPSTREAM = env("API_UPSTREAM", "http://srv-captain--pos360-commerce-api");
+// ✅ Upstreams reales (CapRover)
+const SHOP_UPSTREAM = env(
+  "SHOP_UPSTREAM",
+  "http://srv-captain--pos360-commerce-frontend"
+);
+const API_UPSTREAM = env(
+  "API_UPSTREAM",
+  "http://srv-captain--pos360-commerce-api"
+);
 
 app.disable("x-powered-by");
 
-// health
-app.get("/health", (_req, res) => res.status(200).json({ ok: true, service: "pos360-edge" }));
+// ------------------------------------------------------
+// ✅ HEALTH
+// ------------------------------------------------------
+app.get("/health", (_req, res) =>
+  res.status(200).json({ ok: true, service: "pos360-edge" })
+);
+
+// ------------------------------------------------------
+// ✅ /app → /shop  (ALIAS PÚBLICO, SOPORTA HEAD/GET/LO QUE SEA)
+// ------------------------------------------------------
+// Matchea: /app , /app/ , /app/lo-que-sea
+app.use(/^\/app(\/|$)/, (req, res) => {
+  // req.originalUrl puede tener querystring
+  const original = String(req.originalUrl || "");
+  const withoutPrefix = original.replace(/^\/app\/?/, ""); // deja "" o "ruta?qs"
+  const target = withoutPrefix ? `/shop/${withoutPrefix}` : "/shop/";
+  return res.redirect(302, target);
+});
 
 // ------------------------------------------------------
 // ✅ PROXY SHOP
@@ -51,10 +76,7 @@ app.use(
 // ------------------------------------------------------
 // ✅ PROXY API
 // ------------------------------------------------------
-// IMPORTANTE:
-// - Montamos en /api
-// - NO hacemos pathRewrite
-// Resultado: /api/v1/... -> API_UPSTREAM/api/v1/...
+// /api/v1/... -> API_UPSTREAM/api/v1/...
 app.use(
   "/api",
   createProxyMiddleware({
@@ -74,7 +96,7 @@ app.use(
   })
 );
 
-// root -> /shop/
+// ROOT → /shop/
 app.get("/", (_req, res) => res.redirect(302, "/shop/"));
 
 // 404 final
