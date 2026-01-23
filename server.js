@@ -1,15 +1,16 @@
 /**
- * pos360-edge (COPY-PASTE FINAL - OG FIX + /app ASSETS FIX)
+ * pos360-edge (COPY-PASTE FINAL - MIME FIX + OG FIX SIN /public/products)
  *
  * ✅ YA ANDA:
  * - /public/catalog -> api/v1/public/catalog (rewrite correcto)
  *
  * FIXES:
- * - ✅ /app y /app/*: proxy al frontend (admin) sin inyección
- * - ✅ /app/assets/* y /assets/*: proxy PRIORITARIO para evitar MIME text/html
+ * - ✅ /app/assets/* -> upstream /assets/*  (evita devolver index.html => MIME text/html)
+ * - ✅ /index-*.js|css -> upstream /assets/index-*.js|css (compat)
  * - OG por producto SIN endpoint /public/products (usa /public/catalog)
  * - og:image fallback: SIEMPRE imagen real /og-default.png (image/png)
  * - NO usar favicon.png como og:image jamás
+ * - /app y /app/*: proxy al frontend (admin) sin inyección
  * - Proxy resto al frontend + rewrite de Location para que no salga srv-captain
  */
 
@@ -24,15 +25,8 @@ const PORT = process.env.PORT || 3000;
    ENV
    ========================= */
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "https://sanjuantecnologia.com").replace(/\/+$/, "");
-
-// Frontend shop (tienda)
 const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
 const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/shop").replace(/\/+$/, "");
-
-// ✅ Frontend admin (/app) — si no lo seteás, cae al mismo FRONTEND_INTERNAL
-// Recomendado setearlo a otro container si tenés admin separado:
-// ADMIN_INTERNAL=http://srv-captain--pos360-app
-const ADMIN_INTERNAL = String(process.env.ADMIN_INTERNAL || FRONTEND_INTERNAL).replace(/\/+$/, "");
 
 const API_ORIGIN = String(process.env.API_ORIGIN || "https://pos360-commerce-api.cingulado.org").replace(/\/+$/, "");
 const API_BASE = String(process.env.API_BASE || `${API_ORIGIN}/api/v1`).replace(/\/+$/, "");
@@ -71,7 +65,7 @@ function wantsHtml(req) {
 function isAssetPath(p) {
   return (
     p.startsWith("/assets/") ||
-    p.startsWith("/app/assets/") || // ✅ CLAVE para /app
+    p.startsWith("/app/assets/") || // ✅ importante
     p.startsWith("/favicon") ||
     p.startsWith("/robots.txt") ||
     p.startsWith("/sitemap") ||
@@ -147,14 +141,14 @@ async function loadBranding() {
 }
 
 /* =========================
-   PRODUCT OG via /public/catalog
+   PRODUCT OG via /public/catalog (sin /public/products)
    ========================= */
 async function tryCatalogUrl(paramsObj) {
   const u = new URL(`${API_BASE}/public/catalog`);
   u.searchParams.set("branch_id", String(OG_BRANCH_ID || 3));
   u.searchParams.set("page", "1");
   u.searchParams.set("limit", "1");
-  u.searchParams.set("in_stock", "0");
+  u.searchParams.set("in_stock", "0"); // no dependas de stock para OG
 
   for (const [k, v] of Object.entries(paramsObj)) {
     u.searchParams.set(k, String(v));
@@ -191,7 +185,7 @@ async function loadProductForOgFromCatalog(productId) {
     } catch {}
   }
 
-  // último recurso (limitado)
+  // último recurso: buscar en primeras 50 (limitado)
   try {
     const u = new URL(`${API_BASE}/public/catalog`);
     u.searchParams.set("branch_id", String(OG_BRANCH_ID || 3));
@@ -217,28 +211,39 @@ async function loadProductForOgFromCatalog(productId) {
 app.get("/", (req, res) => res.redirect(301, "/shop"));
 
 /* =========================================================
-   ✅ 0) ASSETS PROXY PRIORITARIO (EVITA MIME text/html)
+   ✅ FIX MIME: /app/assets/* -> /assets/* en upstream
+   (si no, upstream devuelve index.html => text/html)
    ========================================================= */
-
-// Admin assets si tu build usa base "/app/" (recomendado para /app)
 app.use(
   "/app/assets",
-  createProxyMiddleware({
-    target: ADMIN_INTERNAL,
-    changeOrigin: true,
-    ws: true,
-  })
-);
-
-// Shop/assets generales
-app.use(
-  "/assets",
   createProxyMiddleware({
     target: FRONTEND_INTERNAL,
     changeOrigin: true,
     ws: true,
+    pathRewrite: (p) => p.replace(/^\/app\/assets/, "/assets"),
+    onProxyRes(proxyRes) {
+      const loc = proxyRes.headers["location"];
+      if (loc && typeof loc === "string") {
+        proxyRes.headers["location"] = loc
+          .replace(/^http:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL)
+          .replace(/^https:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL);
+      }
+    },
   })
 );
+
+/* =========================================================
+   ✅ compat: /index-xxx.js|css -> /assets/index-xxx.js|css
+   (por si algún HTML quedó mal referenciado)
+   ========================================================= */
+app.get(/^\/index-[A-Za-z0-9_-]+\.(js|css)$/, (req, res, next) => {
+  req.url = `/assets${req.url}`;
+  return createProxyMiddleware({
+    target: FRONTEND_INTERNAL,
+    changeOrigin: true,
+    ws: true,
+  })(req, res, next);
+});
 
 /* =========================
    /app (admin) => proxy directo (sin inyección)
@@ -246,7 +251,7 @@ app.use(
 app.use(
   "/app",
   createProxyMiddleware({
-    target: ADMIN_INTERNAL,
+    target: FRONTEND_INTERNAL,
     changeOrigin: true,
     ws: true,
     autoRewrite: true,
@@ -255,8 +260,8 @@ app.use(
       const loc = proxyRes.headers["location"];
       if (loc && typeof loc === "string") {
         proxyRes.headers["location"] = loc
-          .replace(/^http:\/\/srv-captain--/i, `${PUBLIC_BASE_URL.replace(/\/+$/, "")}/`)
-          .replace(/^https:\/\/srv-captain--/i, `${PUBLIC_BASE_URL.replace(/\/+$/, "")}/`);
+          .replace(/^http:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL)
+          .replace(/^https:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL);
       }
     },
   })
@@ -335,6 +340,8 @@ app.get("*", async (req, res, next) => {
     const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || "/shop"}`;
 
     const favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
+
+    // ✅ og:image fallback SIEMPRE real
     let ogImage = branding.ogImage || `${PUBLIC_BASE_URL}/og-default.png`;
 
     // ✅ PRODUCT OG desde /public/catalog
@@ -402,7 +409,7 @@ app.get("*", async (req, res, next) => {
 });
 
 /* =========================
-   Proxy resto al SHOP frontend
+   Proxy resto al frontend
    + Location rewrite srv-captain -> dominio público
    ========================= */
 app.use(
