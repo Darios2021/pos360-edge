@@ -2,11 +2,14 @@ FROM node:20-alpine
 
 WORKDIR /usr/src/app
 
+# Instala dependencias primero (caching)
 COPY package.json package-lock.json* ./
-RUN npm install --production
+RUN npm ci --omit=dev || npm install --omit=dev
 
-COPY server.js ./
+# Copia el resto
+COPY . .
 
 ENV NODE_ENV=production
 EXPOSE 3000
-CMD ["node", "server.js"]
+
+CMD ["npm", "start"]
