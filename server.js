@@ -1,8 +1,9 @@
 /**
- * pos360-edge (FIX para frontend que redirecciona / -> /shop)
- * - Inyecta <head> dinámico (title/og/fav) consultando al backend
- * - Sirve HTML (SPA) desde el frontend interno (tomando /shop por default)
- * - Proxy del resto (assets, etc.) al frontend
+ * pos360-edge (FINAL)
+ * - Dominio público pasa por EDGE
+ * - / -> /shop (controlado por EDGE)
+ * - Inyección de <head> (OG + favicon) en TODAS las rutas HTML
+ * - Assets / API se proxyean normal
  */
 
 const express = require("express");
@@ -13,164 +14,134 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "https://sanjuantecnologia.com").replace(/\/+$/, "");
-const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://sanjuantecnologia.com").replace(/\/+$/, "");
+const FRONTEND_INTERNAL = (process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
+const FRONTEND_INDEX_PATH = process.env.FRONTEND_INDEX_PATH || "/shop";
 
-// ✅ CLAVE: en tu frontend / redirige a /shop
-const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/shop");
+const API_BASE = (process.env.API_BASE || "").replace(/\/+$/, "");
+const BRANDING_ENDPOINT = process.env.BRANDING_ENDPOINT || "/shop/branding/public";
+const CACHE_SECONDS = parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10);
 
-const API_BASE = String(process.env.API_BASE || "https://pos360-commerce-api.cingulado.org/api/v1").replace(/\/+$/, "");
-const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/shop/branding/public");
-
-const CACHE_SECONDS = Math.max(5, parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10) || 60);
-
-function esc(s) {
-  return String(s || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+function esc(s = "") {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
-function absUrl(u) {
-  const s = String(u || "").trim();
-  if (!s) return "";
-  if (/^https?:\/\//i.test(s)) return s;
-  if (s.startsWith("//")) return `https:${s}`;
-  return `${PUBLIC_BASE_URL}${s.startsWith("/") ? "" : "/"}${s}`;
+function absUrl(u = "") {
+  if (!u) return "";
+  if (u.startsWith("http")) return u;
+  return `${PUBLIC_BASE_URL}${u.startsWith("/") ? "" : "/"}${u}`;
 }
 
-function wantsHtml(req) {
-  const a = String(req.headers.accept || "");
-  // navegadores y bots suelen pedir text/html o */*
-  return a.includes("text/html") || a.includes("*/*") || a === "";
-}
-
-function isAssetPath(p) {
-  // assets típicos de Vite + cosas que no deben convertirse a index.html
+function isAsset(path) {
   return (
-    p.startsWith("/assets/") ||
-    p.startsWith("/api/") ||
-    p.startsWith("/api/v1/") ||
-    p.startsWith("/favicon") ||
-    p.startsWith("/robots.txt") ||
-    p.startsWith("/sitemap") ||
-    p.startsWith("/.well-known/") ||
-    /\.[a-z0-9]{2,5}$/i.test(p) // .js .css .png .jpg .svg .ico etc
+    path.startsWith("/assets/") ||
+    path.startsWith("/api/") ||
+    path.startsWith("/favicon") ||
+    path.startsWith("/robots.txt") ||
+    path.startsWith("/sitemap") ||
+    path.startsWith("/.well-known") ||
+    /\.[a-z0-9]{2,5}$/i.test(path)
   );
 }
 
-// ---------- branding cache ----------
-let cachedBranding = null;
-let cachedAt = 0;
+function wantsHtml(req) {
+  const a = req.headers.accept || "";
+  return a.includes("text/html") || a.includes("*/*") || !a;
+}
 
-async function loadBranding() {
+/* =========================
+   BRANDING CACHE
+   ========================= */
+let cache = null;
+let cacheAt = 0;
+
+async function getBranding() {
   const now = Date.now();
-  if (cachedBranding && now - cachedAt < CACHE_SECONDS * 1000) return cachedBranding;
+  if (cache && now - cacheAt < CACHE_SECONDS * 1000) return cache;
 
   try {
-    const r = await fetch(`${API_BASE}${BRANDING_ENDPOINT}`, {
-      headers: { Accept: "application/json" },
-      redirect: "follow",
-    });
-    if (!r.ok) throw new Error(`branding http ${r.status}`);
+    const r = await fetch(`${API_BASE}${BRANDING_ENDPOINT}`);
     const j = await r.json();
 
-    const name = j?.name || "San Juan Tecnología";
-    const favicon = absUrl(j?.favicon_url);
-    const ogImage = absUrl(j?.og_image_url || j?.logo_url || j?.favicon_url);
-
-    cachedBranding = { name, favicon, ogImage };
-    cachedAt = now;
-    return cachedBranding;
+    cache = {
+      name: j?.name || "San Juan Tecnología",
+      favicon: absUrl(j?.favicon_url),
+      ogImage: absUrl(j?.og_image_url || j?.logo_url || j?.favicon_url),
+    };
+    cacheAt = now;
+    return cache;
   } catch {
-    cachedBranding = { name: "San Juan Tecnología", favicon: "", ogImage: "" };
-    cachedAt = now;
-    return cachedBranding;
+    cache = { name: "San Juan Tecnología", favicon: "", ogImage: "" };
+    cacheAt = now;
+    return cache;
   }
 }
 
-// ---------- get base index.html from frontend ----------
-async function fetchFrontendIndexHtml() {
-  const url = `${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH.startsWith("/") ? "" : "/"}${FRONTEND_INDEX_PATH}`;
-  const r = await fetch(url, { headers: { Accept: "text/html" }, redirect: "follow" });
-  const html = await r.text();
-  return html;
-}
+/* =========================
+   REDIRECT HOME
+   ========================= */
+app.get("/", (req, res) => {
+  return res.redirect(301, "/shop");
+});
 
-// ---------- inject head into html ----------
-function injectHead(html, branding) {
-  const title = `${branding.name} | Tienda`;
-  const desc = "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas.";
-  const canonical = `${PUBLIC_BASE_URL}/`;
+/* =========================
+   HTML INJECTION
+   ========================= */
+app.get("*", async (req, res, next) => {
+  try {
+    if (isAsset(req.path) || !wantsHtml(req)) return next();
 
-  const favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
-  const ogImage = branding.ogImage || favicon;
+    const [branding, htmlRes] = await Promise.all([
+      getBranding(),
+      fetch(`${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH}`, {
+        headers: { Accept: "text/html" },
+        redirect: "follow",
+      }),
+    ]);
 
-  // limpiar tags previos para no duplicar
-  let out = html;
-  out = out.replace(/<title>.*?<\/title>/is, "");
-  out = out.replace(/<meta\s+name=["']description["'][^>]*>/gi, "");
-  out = out.replace(/<link\s+rel=["']canonical["'][^>]*>/gi, "");
-  out = out.replace(/<link\s+rel=["']icon["'][^>]*>/gi, "");
-  out = out.replace(/<link\s+rel=["']apple-touch-icon["'][^>]*>/gi, "");
-  out = out.replace(/<meta\s+property=["']og:[^"']+["'][^>]*>/gi, "");
-  out = out.replace(/<meta\s+name=["']twitter:[^"']+["'][^>]*>/gi, "");
+    let html = await htmlRes.text();
 
-  const inject = `
-<title>${esc(title)}</title>
-<meta name="description" content="${esc(desc)}" />
-<link rel="canonical" href="${esc(canonical)}" />
+    // limpiar head previo
+    html = html.replace(/<title>.*?<\/title>/is, "");
+    html = html.replace(/<meta[^>]+og:[^>]+>/gi, "");
+    html = html.replace(/<meta[^>]+twitter:[^>]+>/gi, "");
+    html = html.replace(/<link[^>]+icon[^>]*>/gi, "");
 
-<link rel="icon" type="image/png" href="${esc(favicon)}" />
-<link rel="apple-touch-icon" href="${esc(favicon)}" />
+    const head = `
+<title>${esc(branding.name)} | Tienda</title>
+<meta name="description" content="Electrónica, ecommerce, sistemas POS y soluciones tecnológicas." />
+
+<link rel="icon" href="${esc(branding.favicon)}" />
+<link rel="apple-touch-icon" href="${esc(branding.favicon)}" />
 
 <meta property="og:type" content="website" />
-<meta property="og:site_name" content="${esc(branding.name)}" />
 <meta property="og:title" content="${esc(branding.name)}" />
-<meta property="og:description" content="${esc(desc)}" />
-<meta property="og:url" content="${esc(canonical)}" />
-<meta property="og:image" content="${esc(ogImage)}" />
-<meta property="og:image:secure_url" content="${esc(ogImage)}" />
+<meta property="og:description" content="Electrónica, ecommerce, sistemas POS y soluciones tecnológicas." />
+<meta property="og:url" content="${PUBLIC_BASE_URL}/shop" />
+<meta property="og:image" content="${esc(branding.ogImage)}" />
 
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="${esc(branding.name)}" />
-<meta name="twitter:description" content="${esc(desc)}" />
-<meta name="twitter:image" content="${esc(ogImage)}" />
+<meta name="twitter:image" content="${esc(branding.ogImage)}" />
 `;
 
-  out = out.replace(/<\/head>/i, `${inject}\n</head>`);
-  return out;
-}
-
-// ---------- HTML handler (para previews/bots + navegación directa) ----------
-app.get("*", async (req, res, next) => {
-  try {
-    // Si es asset o no pide HTML, proxy normal
-    if (isAssetPath(req.path) || !wantsHtml(req)) return next();
-
-    const [branding, baseHtml] = await Promise.all([loadBranding(), fetchFrontendIndexHtml()]);
-    const html = injectHead(baseHtml, branding);
+    html = html.replace("</head>", `${head}\n</head>`);
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-    res.setHeader("Pragma", "no-cache");
-    res.setHeader("Expires", "0");
-    return res.status(200).send(html);
+    res.setHeader("Cache-Control", "no-store");
+    return res.send(html);
   } catch (e) {
     return next(e);
   }
 });
 
-// favicon.ico “tipo WP”
-app.get("/favicon.ico", async (req, res) => {
-  const b = await loadBranding();
-  if (b?.favicon) return res.redirect(302, b.favicon);
-  return res.status(204).end();
-});
-
-// Proxy del resto al frontend (assets y APIs del frontend)
+/* =========================
+   PROXY RESTO
+   ========================= */
 app.use(
   "/",
   createProxyMiddleware({
