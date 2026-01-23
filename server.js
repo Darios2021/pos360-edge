@@ -1,20 +1,19 @@
 /**
- * pos360-edge (COPY-PASTE FINAL)
+ * pos360-edge (COPY-PASTE FINAL - FIXED)
  *
  * FIXES:
  * - / -> /shop
- * - ✅ /api/v1/*  -> API_ORIGIN/api/v1/*
- * - ✅ /public/*  -> API_ORIGIN/api/v1/public/*   (FIX: catalog devolvía HTML)
+ * - ✅ /api/v1/*  -> API_ORIGIN/api/v1/*     (rewrite correcto en mount)
+ * - ✅ /public/*  -> API_ORIGIN/api/v1/public/* (rewrite correcto en mount)
  * - ✅ OG injection SOLO para SHOP HTML (no /app)
- *   - ✅ /shop/product/:id => OG por producto (usa branch_id)
- * - ✅ /app y /app/* proxy directo al frontend admin (sin inyección)
- * - ✅ /favicon.png SIEMPRE devuelve imagen válida (redirect a branding o PNG 1x1)
- * - ✅ reescribe Location para que nunca salga http://srv-captain--...
+ *   - ✅ /shop/product/:id => OG por producto (usa branch_id + id query)
+ * - ✅ og:image fallback SIEMPRE imagen real (og-default.png) (no redirect raro)
+ * - ✅ /favicon.png y /favicon.ico SIEMPRE imagen real (o redirect a real)
+ * - ✅ Location rewrite para que nunca salga srv-captain en redirects
  */
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
-
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const app = express();
@@ -32,7 +31,6 @@ const API_BASE = String(process.env.API_BASE || `${API_ORIGIN}/api/v1`).replace(
 
 const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/shop/branding/public").trim();
 
-// ✅ tu API de producto requiere branch_id e id -> /public/products?id=303&branch_id=3
 const PRODUCT_PUBLIC_ENDPOINT = String(process.env.PRODUCT_PUBLIC_ENDPOINT || "/public/products").trim();
 const OG_BRANCH_ID = Number(process.env.OG_BRANCH_ID || "3");
 
@@ -85,8 +83,7 @@ function getProductIdFromPath(p) {
 }
 
 /* =========================
-   SAFE OG IMAGE FALLBACK (PNG 1x1)
-   (evita warnings FB: "tipo de contenido no válido")
+   SAFE IMAGE (PNG 1x1) - REAL image/png
    ========================= */
 const ONE_BY_ONE_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/erWn2kAAAAASUVORK5CYII=",
@@ -144,25 +141,10 @@ function pickDescFromProduct(p) {
 }
 
 function pickImageFromProduct(p) {
-  // tu API de catalog entrega image_url
   const tryKeys = ["og_image_url", "image_url", "image", "thumbnail", "thumb", "cover", "main_image", "primary_image"];
   for (const k of tryKeys) {
     const v = p?.[k];
     if (typeof v === "string" && v.trim()) return v.trim();
-  }
-  const arrs = [p?.images, p?.product_images, p?.gallery, p?.photos];
-  for (const a of arrs) {
-    if (Array.isArray(a) && a.length) {
-      const first = a[0];
-      const u =
-        (typeof first === "string" && first) ||
-        first?.url ||
-        first?.image_url ||
-        first?.src ||
-        first?.path ||
-        "";
-      if (u) return String(u);
-    }
   }
   return "";
 }
@@ -170,6 +152,7 @@ function pickImageFromProduct(p) {
 async function loadProductForOg(productId) {
   try {
     const url = new URL(`${API_BASE}${PRODUCT_PUBLIC_ENDPOINT}`);
+    // ✅ tu API exige id + branch_id
     url.searchParams.set("id", String(productId));
     url.searchParams.set("branch_id", String(OG_BRANCH_ID || 3));
 
@@ -198,7 +181,8 @@ async function loadProductForOg(productId) {
 app.get("/", (req, res) => res.redirect(301, "/shop"));
 
 /* =========================
-   1) ✅ API PROXY
+   1) ✅ API PROXY (mount strips /api/v1)
+   /api/v1/* -> API_ORIGIN/api/v1/*
    ========================= */
 app.use(
   "/api/v1",
@@ -207,13 +191,14 @@ app.use(
     changeOrigin: true,
     secure: true,
     ws: true,
-    pathRewrite: { "^/api/v1": "/api/v1" },
+    // ✅ IMPORTANTE: dentro del middleware el path empieza con "/..."
+    pathRewrite: (path) => `/api/v1${path}`,
   })
 );
 
 /* =========================
-   2) ✅ PUBLIC PROXY (CRÍTICO)
-   /public/* -> /api/v1/public/*
+   2) ✅ PUBLIC PROXY (mount strips /public)
+   /public/* -> API_ORIGIN/api/v1/public/*
    ========================= */
 app.use(
   "/public",
@@ -222,23 +207,28 @@ app.use(
     changeOrigin: true,
     secure: true,
     ws: true,
-    pathRewrite: { "^/public": "/api/v1/public" },
+    // ✅ IMPORTANTE: dentro del middleware el path empieza con "/catalog..."
+    pathRewrite: (path) => `/api/v1/public${path}`,
   })
 );
 
 /* =========================
-   3) favicon.ico + favicon.png (FIX 404)
+   3) favicon (NO 404)
+   - Para browser puede ser branding
+   - Para seguridad: si no hay branding => imagen real (og-default.png)
    ========================= */
 app.get("/favicon.ico", async (req, res) => {
   const b = await loadBranding();
   if (b?.favicon) return res.redirect(302, b.favicon);
-  return res.redirect(302, `${PUBLIC_BASE_URL}/og-default.png`);
+  res.setHeader("Content-Type", "image/png");
+  return res.status(200).send(ONE_BY_ONE_PNG);
 });
 
 app.get("/favicon.png", async (req, res) => {
   const b = await loadBranding();
   if (b?.favicon) return res.redirect(302, b.favicon);
-  return res.redirect(302, `${PUBLIC_BASE_URL}/og-default.png`);
+  res.setHeader("Content-Type", "image/png");
+  return res.status(200).send(ONE_BY_ONE_PNG);
 });
 
 /* =========================
@@ -251,7 +241,7 @@ app.get("*", async (req, res, next) => {
     if (req.path.startsWith("/api/v1/")) return next();
     if (req.path.startsWith("/public/")) return next();
 
-    // ✅ /app sin inyección
+    // ✅ NO tocar /app (admin)
     if (req.path === "/app" || req.path.startsWith("/app/")) return next();
 
     const [branding, indexRes] = await Promise.all([
@@ -268,9 +258,12 @@ app.get("*", async (req, res, next) => {
     let desc = "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas.";
     const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || "/shop"}`;
 
-    let favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
-    let ogImage = branding.ogImage || favicon || `${PUBLIC_BASE_URL}/og-default.png`;
+    const favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
 
+    // ✅ og:image fallback REAL (no redirect)
+    let ogImage = branding.ogImage || `${PUBLIC_BASE_URL}/og-default.png`;
+
+    // ✅ PRODUCT OG
     if (isShopProductPath(req.path)) {
       const productId = getProductIdFromPath(req.path);
       if (productId) {
@@ -280,19 +273,6 @@ app.get("*", async (req, res, next) => {
         if (p?.image) ogImage = p.image;
       }
     }
-
-    // Remover placeholders si el prerender los dejó
-    html = html
-      .replaceAll("__TITLE__", "")
-      .replaceAll("__DESCRIPTION__", "")
-      .replaceAll("__CANONICAL__", "")
-      .replaceAll("__FAVICON__", "")
-      .replaceAll("__SITE_NAME__", "")
-      .replaceAll("__OG_TITLE__", "")
-      .replaceAll("__OG_DESCRIPTION__", "")
-      .replaceAll("__OG_URL__", "")
-      .replaceAll("__OG_IMAGE__", "")
-      .replaceAll("__OG_IMAGE_ALT__", "");
 
     // Evitar duplicados
     html = html.replace(/<title>.*?<\/title>/is, "");
@@ -342,8 +322,8 @@ app.get("*", async (req, res, next) => {
 });
 
 /* =========================
-   5) PROXY resto al frontend (incluye /app)
-   + Location rewrite (FIX srv-captain)
+   5) Proxy resto al frontend (incluye /app)
+   + Location rewrite srv-captain -> dominio público
    ========================= */
 app.use(
   "/",
