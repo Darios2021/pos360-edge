@@ -1,49 +1,36 @@
 /**
- * pos360-edge (FINAL PRO + FIX /app + FIX redirect interno)
+ * pos360-edge (FINAL PRO - PRODUCT OG FIX + /app FIX)
  * - / -> /shop
- * - /app -> /admin/shop/branding  (recupera la "plataforma")
- * - Inyecta OG/Favicon en TODAS las rutas HTML
- * - ✅ OG dinámico en /shop/product/:id (title/img/desc)
- * - ✅ Proxy /api/v1/* a commerce-api
- * - ✅ Proxy al frontend interno SIN filtrar srv-captain-- al browser
+ * - ✅ /api/v1/* -> commerce-api (evita "me devuelve HTML")
+ * - Inyecta OG/Favicon en HTML
+ *   - ✅ /shop/product/:id => OG por producto (title/desc/image)
+ *   - resto => OG branding
+ * - ✅ /app y /app/* => proxy directo al frontend (admin)
  */
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
+
+// node-fetch lazy (compat)
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// =========================
-// ENV
-// =========================
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "https://sanjuantecnologia.com").replace(/\/+$/, "");
-const PUBLIC_HOST = (() => {
-  try {
-    return new URL(PUBLIC_BASE_URL).host;
-  } catch {
-    return "sanjuantecnologia.com";
-  }
-})();
+const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
+const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/shop").replace(/\/+$/, "");
 
-const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(
-  /\/+$/,
-  ""
-);
-// ✅ importante: index del frontend (NO /shop)
-const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/").trim() || "/";
+const API_BASE = String(process.env.API_BASE || "https://sanjuantecnologia.com/api/v1").replace(/\/+$/, "");
 
-const API_ORIGIN = String(process.env.API_ORIGIN || "https://pos360-commerce-api.cingulado.org").replace(/\/+$/, "");
-const API_BASE_V1 = String(process.env.API_BASE_V1 || `${API_ORIGIN}/api/v1`).replace(/\/+$/, "");
-
-// Branding público del backend
+// Branding público (tu backend lo sirve en /public/shop/branding o similar)
+// Ajustá SOLO esto si tu endpoint cambió:
 const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/public/shop/branding").trim();
-const BRANDING_CACHE_SECONDS = Math.max(5, parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10) || 60);
 
-// Producto público del backend
-const PRODUCT_ENDPOINT_PREFIX = String(process.env.PRODUCT_ENDPOINT_PREFIX || "/public/products/").trim();
-const PRODUCT_CACHE_SECONDS = Math.max(10, parseInt(process.env.PRODUCT_CACHE_SECONDS || "120", 10) || 120);
+// Producto público (para OG por producto):
+const PRODUCT_PUBLIC_ENDPOINT = String(process.env.PRODUCT_PUBLIC_ENDPOINT || "/public/products").trim();
+
+const CACHE_SECONDS = Math.max(5, parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10) || 60);
 
 function esc(s) {
   return String(s || "")
@@ -78,26 +65,32 @@ function isAssetPath(p) {
   );
 }
 
-function parseProductIdFromPath(p) {
-  const m = String(p || "").match(/^\/shop\/product\/(\d+)(\/)?$/i);
+function isShopProductPath(p) {
+  // /shop/product/303
+  return /^\/shop\/product\/(\d+)(\/)?$/i.test(p);
+}
+function getProductIdFromPath(p) {
+  const m = p.match(/^\/shop\/product\/(\d+)(\/)?$/i);
   if (!m) return null;
-  const id = Number(m[1]);
-  return Number.isFinite(id) && id > 0 ? id : null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-// =========================
-// CACHE: Branding
-// =========================
-let brandingCache = null;
-let brandingCacheAt = 0;
+/* =========================
+   BRANDING CACHE
+   ========================= */
+let cachedBranding = null;
+let cachedAt = 0;
 
 async function loadBranding() {
   const now = Date.now();
-  if (brandingCache && now - brandingCacheAt < BRANDING_CACHE_SECONDS * 1000) return brandingCache;
+  if (cachedBranding && now - cachedAt < CACHE_SECONDS * 1000) return cachedBranding;
 
   try {
-    const url = `${API_BASE_V1}${BRANDING_ENDPOINT.startsWith("/") ? "" : "/"}${BRANDING_ENDPOINT}`;
-    const r = await fetch(url, { headers: { Accept: "application/json" }, redirect: "follow" });
+    const r = await fetch(`${API_BASE}${BRANDING_ENDPOINT}`, {
+      headers: { Accept: "application/json" },
+      redirect: "follow",
+    });
     if (!r.ok) throw new Error(`branding http ${r.status}`);
     const j = await r.json();
 
@@ -105,86 +98,111 @@ async function loadBranding() {
     const favicon = absUrl(j?.favicon_url);
     const ogImage = absUrl(j?.og_image_url || j?.logo_url || j?.favicon_url);
 
-    brandingCache = { name, favicon, ogImage };
-    brandingCacheAt = now;
-    return brandingCache;
+    cachedBranding = { name, favicon, ogImage };
+    cachedAt = now;
+    return cachedBranding;
   } catch {
-    brandingCache = { name: "San Juan Tecnología", favicon: "", ogImage: "" };
-    brandingCacheAt = now;
-    return brandingCache;
+    cachedBranding = { name: "San Juan Tecnología", favicon: "", ogImage: "" };
+    cachedAt = now;
+    return cachedBranding;
   }
 }
 
-// =========================
-// CACHE: Producto
-// =========================
-const productCache = new Map(); // id -> { data, at }
+/* =========================
+   PRODUCT (OG) helper
+   ========================= */
+function pickImageFromProduct(p) {
+  // intentos típicos (adaptable sin romper)
+  const tryKeys = [
+    "og_image_url",
+    "image_url",
+    "image",
+    "thumbnail",
+    "thumb",
+    "cover",
+    "main_image",
+    "primary_image",
+    "photo_url",
+  ];
 
-function pickProductImage(p) {
-  const candidates = [
-    p?.og_image_url,
-    p?.image_url,
-    p?.imageUrl,
-    p?.cover_url,
-    p?.coverUrl,
-    p?.primary_image_url,
-    p?.primaryImageUrl,
-    p?.ProductImages?.[0]?.url,
-    p?.images?.[0]?.url,
-    p?.images?.[0],
-  ].filter(Boolean);
+  for (const k of tryKeys) {
+    const v = p?.[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
 
-  return String(candidates[0] || "").trim();
+  // arrays típicos
+  const arrs = [p?.images, p?.product_images, p?.gallery, p?.photos];
+  for (const a of arrs) {
+    if (Array.isArray(a) && a.length) {
+      const first = a[0];
+      const u =
+        (typeof first === "string" && first) ||
+        first?.url ||
+        first?.image_url ||
+        first?.src ||
+        first?.path ||
+        "";
+      if (u) return String(u);
+    }
+  }
+
+  return "";
 }
-function pickProductTitle(p) {
-  return String(p?.name || p?.title || p?.product_name || "Producto").trim();
+
+function pickDescFromProduct(p) {
+  const keys = ["short_description", "description", "desc", "summary"];
+  for (const k of keys) {
+    const v = p?.[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
 }
-function pickProductDesc(p) {
-  const raw = p?.short_description || p?.shortDescription || p?.description || p?.desc || "";
-  const s = String(raw || "").replace(/\s+/g, " ").trim();
-  if (!s) return "";
-  return s.length > 180 ? `${s.slice(0, 177)}...` : s;
-}
 
-async function loadProduct(id) {
-  const now = Date.now();
-  const cached = productCache.get(id);
-  if (cached && now - cached.at < PRODUCT_CACHE_SECONDS * 1000) return cached.data;
-
-  const url = `${API_BASE_V1}${PRODUCT_ENDPOINT_PREFIX.startsWith("/") ? "" : "/"}${PRODUCT_ENDPOINT_PREFIX}${id}`;
-
+async function loadProductForOg(productId) {
   try {
-    const r = await fetch(url, { headers: { Accept: "application/json" }, redirect: "follow" });
+    const r = await fetch(`${API_BASE}${PRODUCT_PUBLIC_ENDPOINT}/${productId}`, {
+      headers: { Accept: "application/json" },
+      redirect: "follow",
+    });
     if (!r.ok) throw new Error(`product http ${r.status}`);
     const j = await r.json();
-    const data = j?.item || j?.data || j;
 
-    productCache.set(id, { data, at: now });
-    return data;
+    // tolerar envoltorios
+    const p = j?.item || j?.product || j?.data || j;
+
+    const name = String(p?.name || p?.title || "").trim();
+    const desc = pickDescFromProduct(p);
+    const img = pickImageFromProduct(p);
+
+    return {
+      name,
+      desc,
+      image: absUrl(img),
+    };
   } catch {
-    productCache.set(id, { data: null, at: now });
     return null;
   }
 }
 
-// =========================
-// 0) HOME + /app FIX
-// =========================
+/* =========================
+   0) HOME
+   ========================= */
 app.get("/", (req, res) => res.redirect(301, "/shop"));
 
-// ✅ Recuperar tu “plataforma” por /app
-// Podés cambiar el destino a "/" si preferís.
-app.get("/app", (req, res) => res.redirect(302, "/admin/shop/branding"));
-app.get("/app/*", (req, res) => res.redirect(302, "/admin/shop/branding"));
+/* =========================
+   0.1) /app (admin)
+   ========================= */
+app.get("/app", (req, res, next) => next()); // lo maneja el proxy al frontend
+app.get("/app/*", (req, res, next) => next()); // idem
 
-// =========================
-// 1) ✅ API PROXY
-// /api/v1/* -> commerce-api
-// =========================
+/* =========================
+   1) ✅ API PROXY
+   /api/v1/* -> commerce-api
+   ========================= */
 app.use(
   "/api/v1",
   createProxyMiddleware({
-    target: API_ORIGIN,
+    target: "https://pos360-commerce-api.cingulado.org",
     changeOrigin: true,
     secure: true,
     ws: true,
@@ -192,51 +210,48 @@ app.use(
   })
 );
 
-// =========================
-// 2) favicon.ico
-// =========================
-app.get("/favicon.ico", async (req, res) => {
-  const b = await loadBranding();
-  if (b?.favicon) return res.redirect(302, b.favicon);
-  return res.status(204).end();
-});
-
-// =========================
-// 3) HTML INJECTION (OG/Favicon)
-// =========================
+/* =========================
+   2) HTML INJECTION
+   - Solo para navegación HTML
+   - ✅ SOLO para shop (no /app)
+   ========================= */
 app.get("*", async (req, res, next) => {
   try {
     if (req.path.startsWith("/api/v1/") || isAssetPath(req.path) || !wantsHtml(req)) return next();
 
-    const branding = await loadBranding();
+    // ✅ Admin (/app) NO se inyecta con og de shop
+    if (req.path === "/app" || req.path.startsWith("/app/")) return next();
 
-    const indexRes = await fetch(`${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH}`, {
-      headers: { Accept: "text/html" },
-      redirect: "follow",
-    });
+    const [branding, indexRes] = await Promise.all([
+      loadBranding(),
+      fetch(`${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH}`, {
+        headers: { Accept: "text/html" },
+        redirect: "follow",
+      }),
+    ]);
+
     let html = await indexRes.text();
 
+    // base
     let title = `${branding.name} | Tienda`;
     let desc = "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas.";
-    let ogImage = branding.ogImage || branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
+    const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || "/shop"}`;
 
-    const pid = parseProductIdFromPath(req.path);
-    if (pid) {
-      const p = await loadProduct(pid);
-      if (p) {
-        const pt = pickProductTitle(p);
-        const pd = pickProductDesc(p);
-        const pi = pickProductImage(p);
+    let favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
+    let ogImage = branding.ogImage || favicon;
 
-        title = pt ? `${pt} | ${branding.name}` : title;
-        if (pd) desc = pd;
-        if (pi) ogImage = absUrl(pi);
+    // ✅ PRODUCT OG (mejora WhatsApp/Facebook)
+    if (isShopProductPath(req.path)) {
+      const productId = getProductIdFromPath(req.path);
+      if (productId) {
+        const p = await loadProductForOg(productId);
+        if (p?.name) title = `${p.name} | ${branding.name}`;
+        if (p?.desc) desc = p.desc.slice(0, 300);
+        if (p?.image) ogImage = p.image;
       }
     }
 
-    const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || req.path || "/"}`;
-    const favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
-
+    // Evitar duplicados
     html = html.replace(/<title>.*?<\/title>/is, "");
     html = html.replace(/<meta\s+name=["']description["'][^>]*>/gi, "");
     html = html.replace(/<link\s+rel=["']canonical["'][^>]*>/gi, "");
@@ -273,16 +288,24 @@ app.get("*", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
-
     return res.status(200).send(html);
   } catch (e) {
     return next(e);
   }
 });
 
-// =========================
-// 4) Proxy resto al frontend (FIX: no filtrar srv-captain-- en redirects)
-// =========================
+/* =========================
+   3) favicon.ico tipo WordPress
+   ========================= */
+app.get("/favicon.ico", async (req, res) => {
+  const b = await loadBranding();
+  if (b?.favicon) return res.redirect(302, b.favicon);
+  return res.status(204).end();
+});
+
+/* =========================
+   4) Proxy resto al frontend
+   ========================= */
 app.use(
   "/",
   createProxyMiddleware({
@@ -290,28 +313,17 @@ app.use(
     changeOrigin: true,
     ws: true,
 
-    // ✅ manda Host público al nginx interno (por si genera redirects absolutos)
-    onProxyReq: (proxyReq) => {
+    // ✅ evita Location: http://srv-captain--pos360-frontend/...
+    autoRewrite: true,
+    protocolRewrite: "https",
+
+    onProxyReq(proxyReq, req) {
+      // ayudar a upstream a entender el host real
       try {
-        proxyReq.setHeader("Host", PUBLIC_HOST);
-        proxyReq.setHeader("X-Forwarded-Host", PUBLIC_HOST);
+        const host = new URL(PUBLIC_BASE_URL).host;
+        proxyReq.setHeader("X-Forwarded-Host", host);
         proxyReq.setHeader("X-Forwarded-Proto", "https");
       } catch {}
-    },
-
-    // ✅ reescribe Location si viene con srv-captain--pos360-frontend
-    onProxyRes: (proxyRes) => {
-      const loc = proxyRes.headers?.location;
-      if (!loc) return;
-
-      const s = String(loc);
-      if (s.includes("srv-captain--pos360-frontend") || s.includes(FRONTEND_INTERNAL.replace(/^https?:\/\//, ""))) {
-        const fixed = s
-          .replaceAll("http://srv-captain--pos360-frontend", PUBLIC_BASE_URL)
-          .replaceAll("https://srv-captain--pos360-frontend", PUBLIC_BASE_URL);
-
-        proxyRes.headers.location = fixed;
-      }
     },
   })
 );
