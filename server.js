@@ -1,13 +1,10 @@
 /**
- * pos360-edge (FINAL DEFINITIVO)
- * - /        -> /shop
- * - /shop/*  -> ecommerce (SPA) + OG/Title/Favicon inyectados (dinámico)
- * - /app/*   -> plataforma (SPA admin) (mismo frontend o separado via APP_FRONTEND_INTERNAL)
- * - /api/v1/* -> proxy a commerce-api (evita que devuelva HTML)
- *
- * OG:
- * - Genérico para /shop/*
- * - ✅ Dinámico para /shop/product/:id  (usa API /api/v1/public/products/:id)
+ * pos360-edge (FINAL PRO - OG por producto)
+ * - / -> /shop
+ * - Inyecta OG/Favicon en TODAS las rutas HTML
+ * - ✅ OG dinámico en /shop/product/:id (title/img/desc)
+ * - ✅ Proxy /api/v1/* a commerce-api (evita "me devuelve HTML")
+ * - Proxy de assets y resto al frontend interno
  */
 
 const express = require("express");
@@ -22,33 +19,22 @@ const PORT = process.env.PORT || 3000;
 // =========================
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "https://sanjuantecnologia.com").replace(/\/+$/, "");
 
-// Frontends internos (CapRover internal DNS)
-// - FRONTEND_INTERNAL: tu pos360-commerce-frontend (nginx)
-// - APP_FRONTEND_INTERNAL: si el admin estuviera en otra app, setealo distinto
-const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-commerce-frontend").replace(
-  /\/+$/,
-  ""
-);
-const APP_FRONTEND_INTERNAL = String(process.env.APP_FRONTEND_INTERNAL || FRONTEND_INTERNAL).replace(/\/+$/, "");
+const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
+// 👇 IMPORTANTÍSIMO: NO lo dejes en "/shop" si querés que /app u otras rutas funcionen.
+// Con "/" el edge sirve el mismo index del frontend y el router decide.
+const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/");
 
-// Qué endpoint del frontend devolver como index html
-// OJO: tu nginx del frontend redirige / -> /shop/ y sirve siempre /index.html.
-// Para capturar el HTML “base” pedimos /shop (o /shop/) para el ecommerce:
-const FRONTEND_SHOP_INDEX_PATH = String(process.env.FRONTEND_SHOP_INDEX_PATH || "/shop/");
-// Para el admin, vamos a servir /app/ como base (pero el frontend tiene que soportarlo; abajo te digo el ajuste)
-const FRONTEND_APP_INDEX_PATH = String(process.env.FRONTEND_APP_INDEX_PATH || "/app/");
-
-// API pública
 const API_ORIGIN = String(process.env.API_ORIGIN || "https://pos360-commerce-api.cingulado.org").replace(/\/+$/, "");
-const API_BASE = String(process.env.API_BASE || `${API_ORIGIN}/api/v1`).replace(/\/+$/, "");
+const API_BASE_V1 = String(process.env.API_BASE_V1 || `${API_ORIGIN}/api/v1`).replace(/\/+$/, "");
 
-// Branding endpoint (desde API)
-const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/public/shop/branding").replace(/\/+$/, "");
-const CACHE_SECONDS = Math.max(5, parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10) || 60);
+// Branding público (tu endpoint real actual en el backend)
+const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/public/shop/branding").trim(); // se concatena a /api/v1
+const BRANDING_CACHE_SECONDS = Math.max(5, parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10) || 60);
 
-// =========================
-// Helpers
-// =========================
+// Producto público (ajustable)
+const PRODUCT_ENDPOINT_PREFIX = String(process.env.PRODUCT_ENDPOINT_PREFIX || "/public/products/").trim(); // /api/v1/public/products/:id
+const PRODUCT_CACHE_SECONDS = Math.max(10, parseInt(process.env.PRODUCT_CACHE_SECONDS || "120", 10) || 120);
+
 function esc(s) {
   return String(s || "")
     .replaceAll("&", "&amp;")
@@ -68,6 +54,7 @@ function absUrl(u) {
 
 function wantsHtml(req) {
   const a = String(req.headers.accept || "");
+  // WhatsApp/Facebook a veces manda */* o accept vacío
   return a.includes("text/html") || a.includes("*/*") || a === "";
 }
 
@@ -82,27 +69,27 @@ function isAssetPath(p) {
   );
 }
 
-function matchShopProductId(pathname) {
-  // /shop/product/295  -> 295
-  const m = String(pathname || "").match(/^\/shop\/product\/(\d+)(?:\/|$)/i);
-  return m ? m[1] : null;
+function parseProductIdFromPath(p) {
+  // /shop/product/303
+  const m = String(p || "").match(/^\/shop\/product\/(\d+)(\/)?$/i);
+  if (!m) return null;
+  const id = Number(m[1]);
+  return Number.isFinite(id) && id > 0 ? id : null;
 }
 
 // =========================
-// Branding cache
+// CACHE: Branding
 // =========================
-let cachedBranding = null;
-let cachedBrandingAt = 0;
+let brandingCache = null;
+let brandingCacheAt = 0;
 
 async function loadBranding() {
   const now = Date.now();
-  if (cachedBranding && now - cachedBrandingAt < CACHE_SECONDS * 1000) return cachedBranding;
+  if (brandingCache && now - brandingCacheAt < BRANDING_CACHE_SECONDS * 1000) return brandingCache;
 
   try {
-    const r = await fetch(`${API_BASE}${BRANDING_ENDPOINT}`, {
-      headers: { Accept: "application/json" },
-      redirect: "follow",
-    });
+    const url = `${API_BASE_V1}${BRANDING_ENDPOINT.startsWith("/") ? "" : "/"}${BRANDING_ENDPOINT}`;
+    const r = await fetch(url, { headers: { Accept: "application/json" }, redirect: "follow" });
     if (!r.ok) throw new Error(`branding http ${r.status}`);
     const j = await r.json();
 
@@ -110,49 +97,72 @@ async function loadBranding() {
     const favicon = absUrl(j?.favicon_url);
     const ogImage = absUrl(j?.og_image_url || j?.logo_url || j?.favicon_url);
 
-    cachedBranding = { name, favicon, ogImage };
-    cachedBrandingAt = now;
-    return cachedBranding;
+    brandingCache = { name, favicon, ogImage };
+    brandingCacheAt = now;
+    return brandingCache;
   } catch {
-    cachedBranding = { name: "San Juan Tecnología", favicon: "", ogImage: "" };
-    cachedBrandingAt = now;
-    return cachedBranding;
+    brandingCache = { name: "San Juan Tecnología", favicon: "", ogImage: "" };
+    brandingCacheAt = now;
+    return brandingCache;
   }
 }
 
 // =========================
-// Producto meta (para WhatsApp preview)
+// CACHE: Producto
 // =========================
-async function loadProductMeta(productId) {
+const productCache = new Map(); // id -> { data, at }
+
+function pickProductImage(p) {
+  // adaptativo: si tu API devuelve algo distinto, cubrimos varios casos comunes
+  const candidates = [
+    p?.og_image_url,
+    p?.image_url,
+    p?.imageUrl,
+    p?.cover_url,
+    p?.coverUrl,
+    p?.primary_image_url,
+    p?.primaryImageUrl,
+    p?.ProductImages?.[0]?.url,
+    p?.images?.[0]?.url,
+    p?.images?.[0],
+  ].filter(Boolean);
+
+  return String(candidates[0] || "").trim();
+}
+
+function pickProductTitle(p) {
+  return String(p?.name || p?.title || p?.product_name || "Producto").trim();
+}
+
+function pickProductDesc(p) {
+  const raw =
+    p?.short_description ||
+    p?.shortDescription ||
+    p?.description ||
+    p?.desc ||
+    "";
+  const s = String(raw || "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  return s.length > 180 ? `${s.slice(0, 177)}...` : s;
+}
+
+async function loadProduct(id) {
+  const now = Date.now();
+  const cached = productCache.get(id);
+  if (cached && now - cached.at < PRODUCT_CACHE_SECONDS * 1000) return cached.data;
+
+  const url = `${API_BASE_V1}${PRODUCT_ENDPOINT_PREFIX.startsWith("/") ? "" : "/"}${PRODUCT_ENDPOINT_PREFIX}${id}`;
+
   try {
-    const r = await fetch(`${API_BASE}/public/products/${encodeURIComponent(productId)}`, {
-      headers: { Accept: "application/json" },
-      redirect: "follow",
-    });
-    if (!r.ok) return null;
-
+    const r = await fetch(url, { headers: { Accept: "application/json" }, redirect: "follow" });
+    if (!r.ok) throw new Error(`product http ${r.status}`);
     const j = await r.json();
+    const data = j?.item || j?.data || j; // por si tu API envuelve
 
-    // Ajuste robusto: distintos shapes comunes
-    const name = j?.name || j?.product?.name || "";
-    const brand = j?.brand || j?.product?.brand || "";
-    const descRaw = j?.short_description || j?.description || j?.product?.description || "";
-
-    // Imagen principal (varios formatos)
-    const img =
-      j?.image_url ||
-      j?.main_image_url ||
-      j?.product?.image_url ||
-      (Array.isArray(j?.images) && (j.images[0]?.url || j.images[0])) ||
-      (Array.isArray(j?.product_images) && (j.product_images[0]?.url || j.product_images[0])) ||
-      "";
-
-    const title = name ? `${name}${brand ? " · " + brand : ""}` : null;
-    const description = descRaw ? String(descRaw).slice(0, 160) : null;
-    const image = img ? absUrl(img) : null;
-
-    return { title, description, image };
+    productCache.set(id, { data, at: now });
+    return data;
   } catch {
+    productCache.set(id, { data: null, at: now });
     return null;
   }
 }
@@ -178,53 +188,54 @@ app.use(
 );
 
 // =========================
-// 2) ✅ /app -> plataforma (SPA)
-// (si querés admin separado, seteá APP_FRONTEND_INTERNAL)
+// 2) favicon.ico tipo WordPress
 // =========================
-app.use(
-  "/app",
-  createProxyMiddleware({
-    target: APP_FRONTEND_INTERNAL,
-    changeOrigin: true,
-    ws: true,
-  })
-);
+app.get("/favicon.ico", async (req, res) => {
+  const b = await loadBranding();
+  if (b?.favicon) return res.redirect(302, b.favicon);
+  return res.status(204).end();
+});
 
 // =========================
-// 3) HTML Injection SOLO para /shop/*
-// - OG genérico
-// - ✅ OG dinámico en /shop/product/:id
+// 3) HTML INJECTION (todas las rutas HTML)
 // =========================
-app.get("/shop*", async (req, res, next) => {
+app.get("*", async (req, res, next) => {
   try {
-    if (isAssetPath(req.path) || !wantsHtml(req)) return next();
+    if (req.path.startsWith("/api/v1/") || isAssetPath(req.path) || !wantsHtml(req)) return next();
 
-    const productId = matchShopProductId(req.path);
+    const branding = await loadBranding();
 
-    const [branding, productMeta, indexRes] = await Promise.all([
-      loadBranding(),
-      productId ? loadProductMeta(productId) : Promise.resolve(null),
-      fetch(`${FRONTEND_INTERNAL}${FRONTEND_SHOP_INDEX_PATH}`, {
-        headers: { Accept: "text/html" },
-        redirect: "follow",
-      }),
-    ]);
-
+    // Traer el index.html del frontend (una sola app SPA)
+    const indexRes = await fetch(`${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH}`, {
+      headers: { Accept: "text/html" },
+      redirect: "follow",
+    });
     let html = await indexRes.text();
 
-    const siteName = branding.name || "San Juan Tecnología";
+    // Base OG genérico
+    let title = `${branding.name} | Tienda`;
+    let desc = "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas.";
+    let ogImage = branding.ogImage || branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
 
-    const title = productMeta?.title || `${siteName} | Tienda`;
-    const desc =
-      productMeta?.description ||
-      "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas.";
+    // ✅ OG específico para producto
+    const pid = parseProductIdFromPath(req.path);
+    if (pid) {
+      const p = await loadProduct(pid);
+      if (p) {
+        const pt = pickProductTitle(p);
+        const pd = pickProductDesc(p);
+        const pi = pickProductImage(p);
 
-    const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || "/shop"}`;
+        title = pt ? `${pt} | ${branding.name}` : title;
+        if (pd) desc = pd;
+        if (pi) ogImage = absUrl(pi);
+      }
+    }
 
+    const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || req.path || "/"}`;
     const favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
-    const ogImage = productMeta?.image || branding.ogImage || favicon;
 
-    // Evitar duplicados
+    // Limpiar duplicados (si el index trae algo)
     html = html.replace(/<title>.*?<\/title>/is, "");
     html = html.replace(/<meta\s+name=["']description["'][^>]*>/gi, "");
     html = html.replace(/<link\s+rel=["']canonical["'][^>]*>/gi, "");
@@ -241,8 +252,8 @@ app.get("/shop*", async (req, res, next) => {
 <link rel="icon" type="image/png" href="${esc(favicon)}" />
 <link rel="apple-touch-icon" href="${esc(favicon)}" />
 
-<meta property="og:type" content="product" />
-<meta property="og:site_name" content="${esc(siteName)}" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="${esc(branding.name)}" />
 <meta property="og:title" content="${esc(title)}" />
 <meta property="og:description" content="${esc(desc)}" />
 <meta property="og:url" content="${esc(canonical)}" />
@@ -257,6 +268,7 @@ app.get("/shop*", async (req, res, next) => {
 
     html = html.replace(/<\/head>/i, `${inject}\n</head>`);
 
+    // Anti-cache para crawlers (WhatsApp cachea igual, pero esto ayuda)
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.setHeader("Pragma", "no-cache");
@@ -269,17 +281,7 @@ app.get("/shop*", async (req, res, next) => {
 });
 
 // =========================
-// 4) favicon.ico tipo WordPress
-// =========================
-app.get("/favicon.ico", async (req, res) => {
-  const b = await loadBranding();
-  if (b?.favicon) return res.redirect(302, b.favicon);
-  return res.status(204).end();
-});
-
-// =========================
-// 5) Proxy resto al frontend
-// (assets, /shop/* que no agarró el injector, etc.)
+// 4) Proxy resto al frontend
 // =========================
 app.use(
   "/",
