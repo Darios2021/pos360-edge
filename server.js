@@ -3,7 +3,7 @@
  * Reverse proxy por PATH:
  * - /        -> TIENDA (shop)
  * - /shop/*  -> TIENDA
- * - /app/*   -> PLATAFORMA (admin/backoffice)
+ * - /app/*   -> PLATAFORMA (admin/backoffice)  ✅ reescribe Location: /auth -> /app/auth
  * - /api/*   -> API
  */
 
@@ -22,19 +22,18 @@ function env(name, fallback) {
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 
 // 🔗 Upstreams
-// TIENDA (public)
 const SHOP_UPSTREAM = env(
   "SHOP_UPSTREAM",
   "http://srv-captain--pos360-frontend"
 );
 
-// PLATAFORMA (admin)  ✅ AJUSTÁ ESTE NOMBRE AL TUYO REAL
+// ✅ AJUSTÁ al servicio real de la plataforma
 const APP_UPSTREAM = env(
   "APP_UPSTREAM",
   "http://srv-captain--pos360-admin"
 );
 
-// API (backend) ✅ SIN /api acá
+// ✅ SIN /api acá
 const API_UPSTREAM = env(
   "API_UPSTREAM",
   "http://srv-captain--pos360-commerce-api:3000"
@@ -42,8 +41,10 @@ const API_UPSTREAM = env(
 
 app.disable("x-powered-by");
 
-function setForwardedHost(proxyReq, req) {
+function setForwardedHeaders(proxyReq, req, extra = {}) {
   proxyReq.setHeader("X-Forwarded-Host", req.headers.host || "");
+  proxyReq.setHeader("X-Forwarded-Proto", req.headers["x-forwarded-proto"] || "https");
+  Object.entries(extra).forEach(([k, v]) => proxyReq.setHeader(k, v));
 }
 
 // ------------------------------------------------------
@@ -63,7 +64,9 @@ app.use(
     changeOrigin: true,
     xfwd: true,
     ws: true,
-    onProxyReq: setForwardedHost,
+    onProxyReq(proxyReq, req) {
+      setForwardedHeaders(proxyReq, req);
+    },
     onError(err, _req, res) {
       console.error("[api-proxy] error:", err?.message || err);
       if (!res.headersSent) res.status(502);
@@ -74,9 +77,8 @@ app.use(
 
 // ------------------------------------------------------
 // /app/* -> PLATAFORMA (admin)
-// Si tu plataforma en el upstream vive en "/", esto STRIPEA /app:
-//   /app/users -> /users
-// Si tu plataforma realmente vive en "/app" también, BORRÁ pathRewrite.
+// - Hacia el upstream: STRIP /app  (/app/users -> /users)
+// - Hacia el cliente: reescribe Location: /xxx -> /app/xxx (para que NO te saque del prefijo)
 // ------------------------------------------------------
 app.use(
   "/app",
@@ -85,8 +87,40 @@ app.use(
     changeOrigin: true,
     xfwd: true,
     ws: true,
-    pathRewrite: (path) => path.replace(/^\/app/, "") || "/", // ✅ strip /app
-    onProxyReq: setForwardedHost,
+
+    // ✅ hacia el upstream sacamos el prefijo /app
+    pathRewrite: (path) => {
+      const out = path.replace(/^\/app/, "");
+      return out ? out : "/";
+    },
+
+    onProxyReq(proxyReq, req) {
+      // 👇 útil si tu plataforma sabe manejar prefijos
+      setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/app" });
+    },
+
+    onProxyRes(proxyRes, req) {
+      // ✅ si el backend devuelve redirect absoluto: Location: /auth/login
+      // lo convertimos a: Location: /app/auth/login
+      const loc = proxyRes.headers?.location;
+      if (loc && typeof loc === "string") {
+        // si ya viene con /app, no tocamos
+        if (loc.startsWith("/") && !loc.startsWith("/app/") && loc !== "/app") {
+          proxyRes.headers.location = "/app" + loc;
+        }
+      }
+
+      // (opcional) cookies que dependan del path:
+      // si el backend setea cookies con Path=/, podrías querer Path=/app
+      // ⚠️ solo si te hace falta
+      // const sc = proxyRes.headers["set-cookie"];
+      // if (Array.isArray(sc)) {
+      //   proxyRes.headers["set-cookie"] = sc.map((c) =>
+      //     c.replace(/;\s*Path=\/(\s*;|$)/i, "; Path=/app$1")
+      //   );
+      // }
+    },
+
     onError(err, _req, res) {
       console.error("[app-proxy] error:", err?.message || err);
       if (!res.headersSent) res.status(502);
@@ -105,7 +139,9 @@ app.use(
     changeOrigin: true,
     xfwd: true,
     ws: true,
-    onProxyReq: setForwardedHost,
+    onProxyReq(proxyReq, req) {
+      setForwardedHeaders(proxyReq, req);
+    },
     onError(err, _req, res) {
       console.error("[shop-proxy] error:", err?.message || err);
       if (!res.headersSent) res.status(502);
@@ -124,7 +160,9 @@ app.use(
     changeOrigin: true,
     xfwd: true,
     ws: true,
-    onProxyReq: setForwardedHost,
+    onProxyReq(proxyReq, req) {
+      setForwardedHeaders(proxyReq, req);
+    },
     pathRewrite: (path) => {
       if (path === "/") return "/shop/";
       return `/shop${path}`;
