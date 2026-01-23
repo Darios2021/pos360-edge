@@ -1,10 +1,11 @@
 /**
- * pos360-edge (FINAL PRO - OG por producto)
+ * pos360-edge (FINAL PRO + FIX /app + FIX redirect interno)
  * - / -> /shop
+ * - /app -> /admin/shop/branding  (recupera la "plataforma")
  * - Inyecta OG/Favicon en TODAS las rutas HTML
  * - ✅ OG dinámico en /shop/product/:id (title/img/desc)
- * - ✅ Proxy /api/v1/* a commerce-api (evita "me devuelve HTML")
- * - Proxy de assets y resto al frontend interno
+ * - ✅ Proxy /api/v1/* a commerce-api
+ * - ✅ Proxy al frontend interno SIN filtrar srv-captain-- al browser
  */
 
 const express = require("express");
@@ -18,21 +19,30 @@ const PORT = process.env.PORT || 3000;
 // ENV
 // =========================
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "https://sanjuantecnologia.com").replace(/\/+$/, "");
+const PUBLIC_HOST = (() => {
+  try {
+    return new URL(PUBLIC_BASE_URL).host;
+  } catch {
+    return "sanjuantecnologia.com";
+  }
+})();
 
-const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
-// 👇 IMPORTANTÍSIMO: NO lo dejes en "/shop" si querés que /app u otras rutas funcionen.
-// Con "/" el edge sirve el mismo index del frontend y el router decide.
-const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/");
+const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(
+  /\/+$/,
+  ""
+);
+// ✅ importante: index del frontend (NO /shop)
+const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/").trim() || "/";
 
 const API_ORIGIN = String(process.env.API_ORIGIN || "https://pos360-commerce-api.cingulado.org").replace(/\/+$/, "");
 const API_BASE_V1 = String(process.env.API_BASE_V1 || `${API_ORIGIN}/api/v1`).replace(/\/+$/, "");
 
-// Branding público (tu endpoint real actual en el backend)
-const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/public/shop/branding").trim(); // se concatena a /api/v1
+// Branding público del backend
+const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/public/shop/branding").trim();
 const BRANDING_CACHE_SECONDS = Math.max(5, parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10) || 60);
 
-// Producto público (ajustable)
-const PRODUCT_ENDPOINT_PREFIX = String(process.env.PRODUCT_ENDPOINT_PREFIX || "/public/products/").trim(); // /api/v1/public/products/:id
+// Producto público del backend
+const PRODUCT_ENDPOINT_PREFIX = String(process.env.PRODUCT_ENDPOINT_PREFIX || "/public/products/").trim();
 const PRODUCT_CACHE_SECONDS = Math.max(10, parseInt(process.env.PRODUCT_CACHE_SECONDS || "120", 10) || 120);
 
 function esc(s) {
@@ -54,7 +64,6 @@ function absUrl(u) {
 
 function wantsHtml(req) {
   const a = String(req.headers.accept || "");
-  // WhatsApp/Facebook a veces manda */* o accept vacío
   return a.includes("text/html") || a.includes("*/*") || a === "";
 }
 
@@ -70,7 +79,6 @@ function isAssetPath(p) {
 }
 
 function parseProductIdFromPath(p) {
-  // /shop/product/303
   const m = String(p || "").match(/^\/shop\/product\/(\d+)(\/)?$/i);
   if (!m) return null;
   const id = Number(m[1]);
@@ -113,7 +121,6 @@ async function loadBranding() {
 const productCache = new Map(); // id -> { data, at }
 
 function pickProductImage(p) {
-  // adaptativo: si tu API devuelve algo distinto, cubrimos varios casos comunes
   const candidates = [
     p?.og_image_url,
     p?.image_url,
@@ -129,18 +136,11 @@ function pickProductImage(p) {
 
   return String(candidates[0] || "").trim();
 }
-
 function pickProductTitle(p) {
   return String(p?.name || p?.title || p?.product_name || "Producto").trim();
 }
-
 function pickProductDesc(p) {
-  const raw =
-    p?.short_description ||
-    p?.shortDescription ||
-    p?.description ||
-    p?.desc ||
-    "";
+  const raw = p?.short_description || p?.shortDescription || p?.description || p?.desc || "";
   const s = String(raw || "").replace(/\s+/g, " ").trim();
   if (!s) return "";
   return s.length > 180 ? `${s.slice(0, 177)}...` : s;
@@ -157,7 +157,7 @@ async function loadProduct(id) {
     const r = await fetch(url, { headers: { Accept: "application/json" }, redirect: "follow" });
     if (!r.ok) throw new Error(`product http ${r.status}`);
     const j = await r.json();
-    const data = j?.item || j?.data || j; // por si tu API envuelve
+    const data = j?.item || j?.data || j;
 
     productCache.set(id, { data, at: now });
     return data;
@@ -168,9 +168,14 @@ async function loadProduct(id) {
 }
 
 // =========================
-// 0) HOME
+// 0) HOME + /app FIX
 // =========================
 app.get("/", (req, res) => res.redirect(301, "/shop"));
+
+// ✅ Recuperar tu “plataforma” por /app
+// Podés cambiar el destino a "/" si preferís.
+app.get("/app", (req, res) => res.redirect(302, "/admin/shop/branding"));
+app.get("/app/*", (req, res) => res.redirect(302, "/admin/shop/branding"));
 
 // =========================
 // 1) ✅ API PROXY
@@ -188,7 +193,7 @@ app.use(
 );
 
 // =========================
-// 2) favicon.ico tipo WordPress
+// 2) favicon.ico
 // =========================
 app.get("/favicon.ico", async (req, res) => {
   const b = await loadBranding();
@@ -197,7 +202,7 @@ app.get("/favicon.ico", async (req, res) => {
 });
 
 // =========================
-// 3) HTML INJECTION (todas las rutas HTML)
+// 3) HTML INJECTION (OG/Favicon)
 // =========================
 app.get("*", async (req, res, next) => {
   try {
@@ -205,19 +210,16 @@ app.get("*", async (req, res, next) => {
 
     const branding = await loadBranding();
 
-    // Traer el index.html del frontend (una sola app SPA)
     const indexRes = await fetch(`${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH}`, {
       headers: { Accept: "text/html" },
       redirect: "follow",
     });
     let html = await indexRes.text();
 
-    // Base OG genérico
     let title = `${branding.name} | Tienda`;
     let desc = "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas.";
     let ogImage = branding.ogImage || branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
 
-    // ✅ OG específico para producto
     const pid = parseProductIdFromPath(req.path);
     if (pid) {
       const p = await loadProduct(pid);
@@ -235,7 +237,6 @@ app.get("*", async (req, res, next) => {
     const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || req.path || "/"}`;
     const favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
 
-    // Limpiar duplicados (si el index trae algo)
     html = html.replace(/<title>.*?<\/title>/is, "");
     html = html.replace(/<meta\s+name=["']description["'][^>]*>/gi, "");
     html = html.replace(/<link\s+rel=["']canonical["'][^>]*>/gi, "");
@@ -268,7 +269,6 @@ app.get("*", async (req, res, next) => {
 
     html = html.replace(/<\/head>/i, `${inject}\n</head>`);
 
-    // Anti-cache para crawlers (WhatsApp cachea igual, pero esto ayuda)
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.setHeader("Pragma", "no-cache");
@@ -281,7 +281,7 @@ app.get("*", async (req, res, next) => {
 });
 
 // =========================
-// 4) Proxy resto al frontend
+// 4) Proxy resto al frontend (FIX: no filtrar srv-captain-- en redirects)
 // =========================
 app.use(
   "/",
@@ -289,6 +289,30 @@ app.use(
     target: FRONTEND_INTERNAL,
     changeOrigin: true,
     ws: true,
+
+    // ✅ manda Host público al nginx interno (por si genera redirects absolutos)
+    onProxyReq: (proxyReq) => {
+      try {
+        proxyReq.setHeader("Host", PUBLIC_HOST);
+        proxyReq.setHeader("X-Forwarded-Host", PUBLIC_HOST);
+        proxyReq.setHeader("X-Forwarded-Proto", "https");
+      } catch {}
+    },
+
+    // ✅ reescribe Location si viene con srv-captain--pos360-frontend
+    onProxyRes: (proxyRes) => {
+      const loc = proxyRes.headers?.location;
+      if (!loc) return;
+
+      const s = String(loc);
+      if (s.includes("srv-captain--pos360-frontend") || s.includes(FRONTEND_INTERNAL.replace(/^https?:\/\//, ""))) {
+        const fixed = s
+          .replaceAll("http://srv-captain--pos360-frontend", PUBLIC_BASE_URL)
+          .replaceAll("https://srv-captain--pos360-frontend", PUBLIC_BASE_URL);
+
+        proxyRes.headers.location = fixed;
+      }
+    },
   })
 );
 
