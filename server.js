@@ -1,21 +1,20 @@
 /**
- * pos360-edge (COPY-PASTE FINAL DEFINITIVO)
+ * pos360-edge (COPY-PASTE FINAL)
  *
- * Objetivos:
+ * FIXES:
  * - / -> /shop
- * - ✅ /api/v1/* => proxy a commerce-api
- * - ✅ /public/* => proxy a commerce-api (/api/v1/public/*)  <-- FIX “catálogo devuelve HTML”
- * - ✅ Inyección OG/Favicon para TODAS las rutas HTML del SHOP (no /app)
- *   - ✅ /shop/product/:id => OG por producto (requiere branch_id)
- * - ✅ /app y /app/* => proxy directo al frontend (admin), SIN OG injection
- * - ✅ Reescribe Location para que NUNCA aparezca http://srv-captain--...
- * - ✅ og:image fallback siempre válido (PNG 1x1)
+ * - ✅ /api/v1/*  -> API_ORIGIN/api/v1/*
+ * - ✅ /public/*  -> API_ORIGIN/api/v1/public/*   (FIX: catalog devolvía HTML)
+ * - ✅ OG injection SOLO para SHOP HTML (no /app)
+ *   - ✅ /shop/product/:id => OG por producto (usa branch_id)
+ * - ✅ /app y /app/* proxy directo al frontend admin (sin inyección)
+ * - ✅ /favicon.png SIEMPRE devuelve imagen válida (redirect a branding o PNG 1x1)
+ * - ✅ reescribe Location para que nunca salga http://srv-captain--...
  */
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
-// node-fetch lazy (compat)
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const app = express();
@@ -25,22 +24,18 @@ const PORT = process.env.PORT || 3000;
    ENV
    ========================= */
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "https://sanjuantecnologia.com").replace(/\/+$/, "");
-
-// Frontend interno (CapRover service name)
 const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
 const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/shop").replace(/\/+$/, "");
 
-// API origin (recomendado) y API_BASE (compat)
 const API_ORIGIN = String(process.env.API_ORIGIN || "https://pos360-commerce-api.cingulado.org").replace(/\/+$/, "");
 const API_BASE = String(process.env.API_BASE || `${API_ORIGIN}/api/v1`).replace(/\/+$/, "");
 
-// Endpoints API
 const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/shop/branding/public").trim();
-// Tu API de producto pide branch_id e id
+
+// ✅ tu API de producto requiere branch_id e id -> /public/products?id=303&branch_id=3
 const PRODUCT_PUBLIC_ENDPOINT = String(process.env.PRODUCT_PUBLIC_ENDPOINT || "/public/products").trim();
 const OG_BRANCH_ID = Number(process.env.OG_BRANCH_ID || "3");
 
-// Cache branding
 const CACHE_SECONDS = Math.max(5, parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10) || 60);
 
 /* =========================
@@ -82,7 +77,6 @@ function isAssetPath(p) {
 function isShopProductPath(p) {
   return /^\/shop\/product\/(\d+)(\/)?$/i.test(p);
 }
-
 function getProductIdFromPath(p) {
   const m = p.match(/^\/shop\/product\/(\d+)(\/)?$/i);
   if (!m) return null;
@@ -92,7 +86,7 @@ function getProductIdFromPath(p) {
 
 /* =========================
    SAFE OG IMAGE FALLBACK (PNG 1x1)
-   - evita warnings “og:image content-type inválido”
+   (evita warnings FB: "tipo de contenido no válido")
    ========================= */
 const ONE_BY_ONE_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/erWn2kAAAAASUVORK5CYII=",
@@ -138,7 +132,7 @@ async function loadBranding() {
 }
 
 /* =========================
-   PRODUCT OG helper
+   PRODUCT OG
    ========================= */
 function pickDescFromProduct(p) {
   const keys = ["short_description", "description", "desc", "summary"];
@@ -150,25 +144,12 @@ function pickDescFromProduct(p) {
 }
 
 function pickImageFromProduct(p) {
-  // Tu API ya entrega image_url en catalog. En producto puede variar.
-  const tryKeys = [
-    "og_image_url",
-    "image_url",
-    "image",
-    "thumbnail",
-    "thumb",
-    "cover",
-    "main_image",
-    "primary_image",
-    "photo_url",
-    "picture",
-  ];
+  // tu API de catalog entrega image_url
+  const tryKeys = ["og_image_url", "image_url", "image", "thumbnail", "thumb", "cover", "main_image", "primary_image"];
   for (const k of tryKeys) {
     const v = p?.[k];
     if (typeof v === "string" && v.trim()) return v.trim();
   }
-
-  // arrays típicos
   const arrs = [p?.images, p?.product_images, p?.gallery, p?.photos];
   for (const a of arrs) {
     if (Array.isArray(a) && a.length) {
@@ -183,14 +164,9 @@ function pickImageFromProduct(p) {
       if (u) return String(u);
     }
   }
-
   return "";
 }
 
-/**
- * Tu API (según curl) requiere:
- * GET /api/v1/public/products?id=303&branch_id=3
- */
 async function loadProductForOg(productId) {
   try {
     const url = new URL(`${API_BASE}${PRODUCT_PUBLIC_ENDPOINT}`);
@@ -202,20 +178,15 @@ async function loadProductForOg(productId) {
       redirect: "follow",
     });
     if (!r.ok) throw new Error(`product http ${r.status}`);
-    const j = await r.json();
 
-    // tolerar envoltorios
+    const j = await r.json();
     const p = j?.item || j?.product || j?.data || j;
 
     const name = String(p?.name || p?.title || "").trim();
     const desc = pickDescFromProduct(p);
     const img = pickImageFromProduct(p);
 
-    return {
-      name,
-      desc,
-      image: absUrl(img),
-    };
+    return { name, desc, image: absUrl(img) };
   } catch {
     return null;
   }
@@ -227,8 +198,7 @@ async function loadProductForOg(productId) {
 app.get("/", (req, res) => res.redirect(301, "/shop"));
 
 /* =========================
-   1) ✅ API PROXY (tu backend real)
-   /api/v1/* -> API_ORIGIN/api/v1/*
+   1) ✅ API PROXY
    ========================= */
 app.use(
   "/api/v1",
@@ -242,9 +212,8 @@ app.use(
 );
 
 /* =========================
-   2) ✅ PUBLIC PROXY  (FIX catalog HTML)
-   /public/* -> API_ORIGIN/api/v1/public/*
-   Ej: /public/catalog -> /api/v1/public/catalog
+   2) ✅ PUBLIC PROXY (CRÍTICO)
+   /public/* -> /api/v1/public/*
    ========================= */
 app.use(
   "/public",
@@ -258,19 +227,14 @@ app.use(
 );
 
 /* =========================
-   3) favicon.ico (tipo WP)
+   3) favicon.ico + favicon.png (FIX 404)
    ========================= */
 app.get("/favicon.ico", async (req, res) => {
   const b = await loadBranding();
   if (b?.favicon) return res.redirect(302, b.favicon);
-  return res.status(204).end();
+  return res.redirect(302, `${PUBLIC_BASE_URL}/og-default.png`);
 });
 
-/* =========================
-   4) /favicon.png
-   - porque vos estabas usando fallback /favicon.png y te daba 404
-   - ahora: si hay branding.favicon => redirect; sino => og-default.png (200 image/png)
-   ========================= */
 app.get("/favicon.png", async (req, res) => {
   const b = await loadBranding();
   if (b?.favicon) return res.redirect(302, b.favicon);
@@ -278,19 +242,16 @@ app.get("/favicon.png", async (req, res) => {
 });
 
 /* =========================
-   5) HTML INJECTION (SOLO SHOP)
-   - No toca /app
-   - No toca /api/v1 ni /public
+   4) HTML INJECTION (SOLO SHOP)
    ========================= */
 app.get("*", async (req, res, next) => {
   try {
-    // si no es html o es asset/api/public => proxy normal
     if (!wantsHtml(req)) return next();
     if (isAssetPath(req.path)) return next();
     if (req.path.startsWith("/api/v1/")) return next();
     if (req.path.startsWith("/public/")) return next();
 
-    // ✅ /app queda sin inyección (admin)
+    // ✅ /app sin inyección
     if (req.path === "/app" || req.path.startsWith("/app/")) return next();
 
     const [branding, indexRes] = await Promise.all([
@@ -303,16 +264,13 @@ app.get("*", async (req, res, next) => {
 
     let html = await indexRes.text();
 
-    // base OG
     let title = `${branding.name} | Tienda`;
     let desc = "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas.";
     const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || "/shop"}`;
 
-    // favicon + ogImage (fallbacks)
-    let favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`; // ahora existe route y devuelve imagen
+    let favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
     let ogImage = branding.ogImage || favicon || `${PUBLIC_BASE_URL}/og-default.png`;
 
-    // ✅ PRODUCT OG
     if (isShopProductPath(req.path)) {
       const productId = getProductIdFromPath(req.path);
       if (productId) {
@@ -323,7 +281,7 @@ app.get("*", async (req, res, next) => {
       }
     }
 
-    // 🧹 remover placeholders del build prerender si existen
+    // Remover placeholders si el prerender los dejó
     html = html
       .replaceAll("__TITLE__", "")
       .replaceAll("__DESCRIPTION__", "")
@@ -384,9 +342,8 @@ app.get("*", async (req, res, next) => {
 });
 
 /* =========================
-   6) PROXY al frontend
-   - /app y resto (SPA)
-   - ✅ Rewrite Location: evita http://srv-captain--...
+   5) PROXY resto al frontend (incluye /app)
+   + Location rewrite (FIX srv-captain)
    ========================= */
 app.use(
   "/",
@@ -394,13 +351,10 @@ app.use(
     target: FRONTEND_INTERNAL,
     changeOrigin: true,
     ws: true,
-
-    // ayuda a reescrituras
     autoRewrite: true,
     protocolRewrite: "https",
 
     onProxyReq(proxyReq) {
-      // upstream entiende host real
       try {
         const host = new URL(PUBLIC_BASE_URL).host;
         proxyReq.setHeader("X-Forwarded-Host", host);
@@ -409,15 +363,11 @@ app.use(
     },
 
     onProxyRes(proxyRes) {
-      // ✅ si backend devuelve Location: http://srv-captain--pos360-frontend/...
       const loc = proxyRes.headers["location"];
       if (loc && typeof loc === "string") {
-        const fixed = loc
+        proxyRes.headers["location"] = loc
           .replace(/^http:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL)
-          .replace(/^https:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL)
-          .replace(/^http:\/\/srv-captain--pos360-frontend\/?/i, `${PUBLIC_BASE_URL}/`)
-          .replace(/^https:\/\/srv-captain--pos360-frontend\/?/i, `${PUBLIC_BASE_URL}/`);
-        proxyRes.headers["location"] = fixed;
+          .replace(/^https:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL);
       }
     },
   })
