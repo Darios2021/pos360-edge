@@ -1,17 +1,20 @@
 /**
- * pos360-edge (COPY-PASTE FINAL - MIME FIX + OG FIX SIN /public/products)
+ * pos360-edge (COPY-PASTE FINAL)
  *
- * ✅ YA ANDA:
- * - /public/catalog -> api/v1/public/catalog (rewrite correcto)
+ * FIX CRITICO:
+ * - Los assets estaban pidiéndose como /app/assets/* (o /shop/assets/*)
+ *   pero el dist normalmente expone /assets/*.
+ *   => Nginx devuelve index.html (text/html) y el browser rompe (MIME).
  *
- * FIXES:
- * - ✅ /app/assets/* -> upstream /assets/*  (evita devolver index.html => MIME text/html)
- * - ✅ /index-*.js|css -> upstream /assets/index-*.js|css (compat)
- * - OG por producto SIN endpoint /public/products (usa /public/catalog)
- * - og:image fallback: SIEMPRE imagen real /og-default.png (image/png)
- * - NO usar favicon.png como og:image jamás
- * - /app y /app/*: proxy al frontend (admin) sin inyección
- * - Proxy resto al frontend + rewrite de Location para que no salga srv-captain
+ * Solución:
+ * - Proxy de assets ANTES de la inyección OG
+ * - Rewrite:
+ *    /app/assets/*  -> /assets/*
+ *    /shop/assets/* -> /assets/*
+ * - Bypass total de HTML injection para cualquier archivo (.js, .css, .map, etc.)
+ *
+ * OG:
+ * - Mantiene inyección solo para páginas HTML de /shop (NO /app).
  */
 
 const express = require("express");
@@ -62,16 +65,9 @@ function wantsHtml(req) {
   return a.includes("text/html") || a.includes("*/*") || a === "";
 }
 
-function isAssetPath(p) {
-  return (
-    p.startsWith("/assets/") ||
-    p.startsWith("/app/assets/") || // ✅ importante
-    p.startsWith("/favicon") ||
-    p.startsWith("/robots.txt") ||
-    p.startsWith("/sitemap") ||
-    p.startsWith("/.well-known/") ||
-    /\.[a-z0-9]{2,6}$/i.test(p)
-  );
+function isFileRequest(p) {
+  // Cualquier cosa con extensión: .js .css .map .png ...
+  return /\.[a-z0-9]{1,8}$/i.test(p);
 }
 
 function isShopProductPath(p) {
@@ -141,23 +137,18 @@ async function loadBranding() {
 }
 
 /* =========================
-   PRODUCT OG via /public/catalog (sin /public/products)
+   PRODUCT OG via /public/catalog
    ========================= */
 async function tryCatalogUrl(paramsObj) {
   const u = new URL(`${API_BASE}/public/catalog`);
   u.searchParams.set("branch_id", String(OG_BRANCH_ID || 3));
   u.searchParams.set("page", "1");
   u.searchParams.set("limit", "1");
-  u.searchParams.set("in_stock", "0"); // no dependas de stock para OG
+  u.searchParams.set("in_stock", "0");
 
-  for (const [k, v] of Object.entries(paramsObj)) {
-    u.searchParams.set(k, String(v));
-  }
+  for (const [k, v] of Object.entries(paramsObj)) u.searchParams.set(k, String(v));
 
-  const r = await fetch(u.toString(), {
-    headers: { Accept: "application/json" },
-    redirect: "follow",
-  });
+  const r = await fetch(u.toString(), { headers: { Accept: "application/json" }, redirect: "follow" });
   if (!r.ok) return null;
 
   const j = await r.json();
@@ -176,6 +167,7 @@ async function loadProductForOgFromCatalog(productId) {
     { product_id: productId },
     { id: productId },
     { productId: productId },
+    { q: String(productId) },
   ];
 
   for (const a of attempts) {
@@ -184,24 +176,6 @@ async function loadProductForOgFromCatalog(productId) {
       if (it && Number(it.product_id || it.id) === Number(productId)) return it;
     } catch {}
   }
-
-  // último recurso: buscar en primeras 50 (limitado)
-  try {
-    const u = new URL(`${API_BASE}/public/catalog`);
-    u.searchParams.set("branch_id", String(OG_BRANCH_ID || 3));
-    u.searchParams.set("page", "1");
-    u.searchParams.set("limit", "50");
-    u.searchParams.set("in_stock", "0");
-
-    const r = await fetch(u.toString(), { headers: { Accept: "application/json" } });
-    if (r.ok) {
-      const j = await r.json();
-      const items = Array.isArray(j?.items) ? j.items : [];
-      const found = items.find((x) => Number(x.product_id || x.id) === Number(productId));
-      if (found) return found;
-    }
-  } catch {}
-
   return null;
 }
 
@@ -210,65 +184,8 @@ async function loadProductForOgFromCatalog(productId) {
    ========================= */
 app.get("/", (req, res) => res.redirect(301, "/shop"));
 
-/* =========================================================
-   ✅ FIX MIME: /app/assets/* -> /assets/* en upstream
-   (si no, upstream devuelve index.html => text/html)
-   ========================================================= */
-app.use(
-  "/app/assets",
-  createProxyMiddleware({
-    target: FRONTEND_INTERNAL,
-    changeOrigin: true,
-    ws: true,
-    pathRewrite: (p) => p.replace(/^\/app\/assets/, "/assets"),
-    onProxyRes(proxyRes) {
-      const loc = proxyRes.headers["location"];
-      if (loc && typeof loc === "string") {
-        proxyRes.headers["location"] = loc
-          .replace(/^http:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL)
-          .replace(/^https:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL);
-      }
-    },
-  })
-);
-
-/* =========================================================
-   ✅ compat: /index-xxx.js|css -> /assets/index-xxx.js|css
-   (por si algún HTML quedó mal referenciado)
-   ========================================================= */
-app.get(/^\/index-[A-Za-z0-9_-]+\.(js|css)$/, (req, res, next) => {
-  req.url = `/assets${req.url}`;
-  return createProxyMiddleware({
-    target: FRONTEND_INTERNAL,
-    changeOrigin: true,
-    ws: true,
-  })(req, res, next);
-});
-
 /* =========================
-   /app (admin) => proxy directo (sin inyección)
-   ========================= */
-app.use(
-  "/app",
-  createProxyMiddleware({
-    target: FRONTEND_INTERNAL,
-    changeOrigin: true,
-    ws: true,
-    autoRewrite: true,
-    protocolRewrite: "https",
-    onProxyRes(proxyRes) {
-      const loc = proxyRes.headers["location"];
-      if (loc && typeof loc === "string") {
-        proxyRes.headers["location"] = loc
-          .replace(/^http:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL)
-          .replace(/^https:\/\/srv-captain--pos360-frontend/i, PUBLIC_BASE_URL);
-      }
-    },
-  })
-);
-
-/* =========================
-   API PROXY (mount strips /api/v1)
+   API PROXY (/api/v1)
    ========================= */
 app.use(
   "/api/v1",
@@ -277,12 +194,12 @@ app.use(
     changeOrigin: true,
     secure: true,
     ws: true,
-    pathRewrite: (path) => `/api/v1${path}`,
+    pathRewrite: (p) => `/api/v1${p}`,
   })
 );
 
 /* =========================
-   PUBLIC PROXY (mount strips /public)
+   PUBLIC PROXY (/public -> /api/v1/public)
    ========================= */
 app.use(
   "/public",
@@ -291,7 +208,36 @@ app.use(
     changeOrigin: true,
     secure: true,
     ws: true,
-    pathRewrite: (path) => `/api/v1/public${path}`,
+    pathRewrite: (p) => `/api/v1/public${p}`,
+  })
+);
+
+/* =========================
+   ✅ ASSETS PROXY (ANTES QUE TODO)
+   - evita que terminen en HTML injection
+   - arregla /app/assets y /shop/assets -> /assets
+   ========================= */
+app.use(
+  ["/assets", "/app/assets", "/shop/assets"],
+  createProxyMiddleware({
+    target: FRONTEND_INTERNAL,
+    changeOrigin: true,
+    ws: true,
+    autoRewrite: true,
+    onProxyReq(proxyReq) {
+      try {
+        const host = new URL(PUBLIC_BASE_URL).host;
+        proxyReq.setHeader("X-Forwarded-Host", host);
+        proxyReq.setHeader("X-Forwarded-Proto", "https");
+      } catch {}
+    },
+    pathRewrite: (p) => {
+      // /app/assets/x  -> /assets/x
+      // /shop/assets/x -> /assets/x
+      if (p.startsWith("/app/assets/")) return p.replace(/^\/app\/assets\//, "/assets/");
+      if (p.startsWith("/shop/assets/")) return p.replace(/^\/shop\/assets\//, "/assets/");
+      return p; // /assets/*
+    },
   })
 );
 
@@ -313,24 +259,28 @@ app.get("/favicon.png", async (req, res) => {
 });
 
 /* =========================
-   HTML INJECTION (SOLO SHOP)
+   HTML INJECTION (SOLO SHOP HTML)
    ========================= */
 app.get("*", async (req, res, next) => {
   try {
+    // ✅ si no es HTML, o es archivo, no tocamos
     if (!wantsHtml(req)) return next();
-    if (isAssetPath(req.path)) return next();
+    if (isFileRequest(req.path)) return next();
+
+    // ✅ no tocar API
     if (req.path.startsWith("/api/v1/")) return next();
     if (req.path.startsWith("/public/")) return next();
 
-    // ✅ NO tocar /app (admin)
+    // ✅ no tocar /app (admin)
     if (req.path === "/app" || req.path.startsWith("/app/")) return next();
+
+    // ✅ no tocar assets (por las dudas)
+    if (req.path.startsWith("/assets/") || req.path.startsWith("/app/assets/") || req.path.startsWith("/shop/assets/"))
+      return next();
 
     const [branding, indexRes] = await Promise.all([
       loadBranding(),
-      fetch(`${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH}`, {
-        headers: { Accept: "text/html" },
-        redirect: "follow",
-      }),
+      fetch(`${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH}`, { headers: { Accept: "text/html" }, redirect: "follow" }),
     ]);
 
     let html = await indexRes.text();
@@ -340,11 +290,8 @@ app.get("*", async (req, res, next) => {
     const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || "/shop"}`;
 
     const favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
-
-    // ✅ og:image fallback SIEMPRE real
     let ogImage = branding.ogImage || `${PUBLIC_BASE_URL}/og-default.png`;
 
-    // ✅ PRODUCT OG desde /public/catalog
     if (isShopProductPath(req.path)) {
       const productId = getProductIdFromPath(req.path);
       if (productId) {
@@ -420,7 +367,6 @@ app.use(
     ws: true,
     autoRewrite: true,
     protocolRewrite: "https",
-
     onProxyReq(proxyReq) {
       try {
         const host = new URL(PUBLIC_BASE_URL).host;
@@ -428,7 +374,6 @@ app.use(
         proxyReq.setHeader("X-Forwarded-Proto", "https");
       } catch {}
     },
-
     onProxyRes(proxyRes) {
       const loc = proxyRes.headers["location"];
       if (loc && typeof loc === "string") {
