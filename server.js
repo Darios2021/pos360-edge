@@ -1,7 +1,8 @@
 /**
- * pos360-edge
- * - Sirve "/" con <head> dinámico (title/og/fav) consultando al backend
- * - Proxy del resto (assets + SPA) al frontend interno CapRover
+ * pos360-edge (FIX para frontend que redirecciona / -> /shop)
+ * - Inyecta <head> dinámico (title/og/fav) consultando al backend
+ * - Sirve HTML (SPA) desde el frontend interno (tomando /shop por default)
+ * - Proxy del resto (assets, etc.) al frontend
  */
 
 const express = require("express");
@@ -12,19 +13,15 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-// Dominio final público
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "https://sanjuantecnologia.com").replace(/\/+$/, "");
-
-// Frontend interno (nombre servicio CapRover)
 const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
 
-// Backend (API v1)
-const API_BASE = String(process.env.API_BASE || "https://pos360-commerce-api.cingulado.org/api/v1").replace(/\/+$/, "");
+// ✅ CLAVE: en tu frontend / redirige a /shop
+const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/shop");
 
-// Endpoint público branding (lo creamos en backend)
+const API_BASE = String(process.env.API_BASE || "https://pos360-commerce-api.cingulado.org/api/v1").replace(/\/+$/, "");
 const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/shop/branding/public");
 
-// Cache branding
 const CACHE_SECONDS = Math.max(5, parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10) || 60);
 
 function esc(s) {
@@ -44,6 +41,26 @@ function absUrl(u) {
   return `${PUBLIC_BASE_URL}${s.startsWith("/") ? "" : "/"}${s}`;
 }
 
+function wantsHtml(req) {
+  const a = String(req.headers.accept || "");
+  // navegadores y bots suelen pedir text/html o */*
+  return a.includes("text/html") || a.includes("*/*") || a === "";
+}
+
+function isAssetPath(p) {
+  // assets típicos de Vite + cosas que no deben convertirse a index.html
+  return (
+    p.startsWith("/assets/") ||
+    p.startsWith("/api/") ||
+    p.startsWith("/api/v1/") ||
+    p.startsWith("/favicon") ||
+    p.startsWith("/robots.txt") ||
+    p.startsWith("/sitemap") ||
+    p.startsWith("/.well-known/") ||
+    /\.[a-z0-9]{2,5}$/i.test(p) // .js .css .png .jpg .svg .ico etc
+  );
+}
+
 // ---------- branding cache ----------
 let cachedBranding = null;
 let cachedAt = 0;
@@ -53,7 +70,10 @@ async function loadBranding() {
   if (cachedBranding && now - cachedAt < CACHE_SECONDS * 1000) return cachedBranding;
 
   try {
-    const r = await fetch(`${API_BASE}${BRANDING_ENDPOINT}`, { headers: { Accept: "application/json" } });
+    const r = await fetch(`${API_BASE}${BRANDING_ENDPOINT}`, {
+      headers: { Accept: "application/json" },
+      redirect: "follow",
+    });
     if (!r.ok) throw new Error(`branding http ${r.status}`);
     const j = await r.json();
 
@@ -64,20 +84,23 @@ async function loadBranding() {
     cachedBranding = { name, favicon, ogImage };
     cachedAt = now;
     return cachedBranding;
-  } catch (e) {
+  } catch {
     cachedBranding = { name: "San Juan Tecnología", favicon: "", ogImage: "" };
     cachedAt = now;
     return cachedBranding;
   }
 }
 
-// ---------- inject index ----------
-async function serveInjectedIndex(req, res) {
-  const indexRes = await fetch(`${FRONTEND_INTERNAL}/`, { headers: { Accept: "text/html" } });
-  let html = await indexRes.text();
+// ---------- get base index.html from frontend ----------
+async function fetchFrontendIndexHtml() {
+  const url = `${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH.startsWith("/") ? "" : "/"}${FRONTEND_INDEX_PATH}`;
+  const r = await fetch(url, { headers: { Accept: "text/html" }, redirect: "follow" });
+  const html = await r.text();
+  return html;
+}
 
-  const branding = await loadBranding();
-
+// ---------- inject head into html ----------
+function injectHead(html, branding) {
   const title = `${branding.name} | Tienda`;
   const desc = "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas.";
   const canonical = `${PUBLIC_BASE_URL}/`;
@@ -85,14 +108,15 @@ async function serveInjectedIndex(req, res) {
   const favicon = branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
   const ogImage = branding.ogImage || favicon;
 
-  // Evitar duplicados
-  html = html.replace(/<title>.*?<\/title>/is, "");
-  html = html.replace(/<meta\s+name=["']description["'][^>]*>/gi, "");
-  html = html.replace(/<link\s+rel=["']canonical["'][^>]*>/gi, "");
-  html = html.replace(/<link\s+rel=["']icon["'][^>]*>/gi, "");
-  html = html.replace(/<link\s+rel=["']apple-touch-icon["'][^>]*>/gi, "");
-  html = html.replace(/<meta\s+property=["']og:[^"']+["'][^>]*>/gi, "");
-  html = html.replace(/<meta\s+name=["']twitter:[^"']+["'][^>]*>/gi, "");
+  // limpiar tags previos para no duplicar
+  let out = html;
+  out = out.replace(/<title>.*?<\/title>/is, "");
+  out = out.replace(/<meta\s+name=["']description["'][^>]*>/gi, "");
+  out = out.replace(/<link\s+rel=["']canonical["'][^>]*>/gi, "");
+  out = out.replace(/<link\s+rel=["']icon["'][^>]*>/gi, "");
+  out = out.replace(/<link\s+rel=["']apple-touch-icon["'][^>]*>/gi, "");
+  out = out.replace(/<meta\s+property=["']og:[^"']+["'][^>]*>/gi, "");
+  out = out.replace(/<meta\s+name=["']twitter:[^"']+["'][^>]*>/gi, "");
 
   const inject = `
 <title>${esc(title)}</title>
@@ -116,25 +140,37 @@ async function serveInjectedIndex(req, res) {
 <meta name="twitter:image" content="${esc(ogImage)}" />
 `;
 
-  html = html.replace(/<\/head>/i, `${inject}\n</head>`);
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
-
-  return res.status(200).send(html);
+  out = out.replace(/<\/head>/i, `${inject}\n</head>`);
+  return out;
 }
 
-app.get("/", serveInjectedIndex);
+// ---------- HTML handler (para previews/bots + navegación directa) ----------
+app.get("*", async (req, res, next) => {
+  try {
+    // Si es asset o no pide HTML, proxy normal
+    if (isAssetPath(req.path) || !wantsHtml(req)) return next();
 
+    const [branding, baseHtml] = await Promise.all([loadBranding(), fetchFrontendIndexHtml()]);
+    const html = injectHead(baseHtml, branding);
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    return res.status(200).send(html);
+  } catch (e) {
+    return next(e);
+  }
+});
+
+// favicon.ico “tipo WP”
 app.get("/favicon.ico", async (req, res) => {
   const b = await loadBranding();
   if (b?.favicon) return res.redirect(302, b.favicon);
   return res.status(204).end();
 });
 
-// Proxy todo lo demás al frontend
+// Proxy del resto al frontend (assets y APIs del frontend)
 app.use(
   "/",
   createProxyMiddleware({
