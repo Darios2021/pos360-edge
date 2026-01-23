@@ -1,10 +1,10 @@
 /**
  * ✅ pos360-edge/server.js
- * Reverse proxy por PATH (SIN REDIRECTS):
- * - /shop/* -> frontend (tienda)
- * - /app/*  -> frontend (internamente como /shop/*)
- * - /api/*  -> api
- * - /       -> frontend (como /shop/*)
+ * Reverse proxy por PATH:
+ * - /        -> TIENDA (shop)
+ * - /shop/*  -> TIENDA
+ * - /app/*   -> PLATAFORMA (admin/backoffice)
+ * - /api/*   -> API
  */
 
 const express = require("express");
@@ -21,20 +21,30 @@ function env(name, fallback) {
 
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 
-// 🔗 Upstreams reales
-// Tienda (frontend público)
+// 🔗 Upstreams
+// TIENDA (public)
 const SHOP_UPSTREAM = env(
   "SHOP_UPSTREAM",
   "http://srv-captain--pos360-frontend"
 );
 
-// API (backend) OJO: SIN /api acá, para no duplicar paths
+// PLATAFORMA (admin)  ✅ AJUSTÁ ESTE NOMBRE AL TUYO REAL
+const APP_UPSTREAM = env(
+  "APP_UPSTREAM",
+  "http://srv-captain--pos360-admin"
+);
+
+// API (backend) ✅ SIN /api acá
 const API_UPSTREAM = env(
   "API_UPSTREAM",
   "http://srv-captain--pos360-commerce-api:3000"
 );
 
 app.disable("x-powered-by");
+
+function setForwardedHost(proxyReq, req) {
+  proxyReq.setHeader("X-Forwarded-Host", req.headers.host || "");
+}
 
 // ------------------------------------------------------
 // HEALTH
@@ -43,100 +53,93 @@ app.get("/health", (_req, res) =>
   res.status(200).json({ ok: true, service: "pos360-edge" })
 );
 
-// Helpers: middlewares instanciados UNA sola vez (no por request)
-function setForwardedHost(proxyReq, req) {
-  proxyReq.setHeader("X-Forwarded-Host", req.headers.host || "");
-}
+// ------------------------------------------------------
+// /api/* -> API
+// ------------------------------------------------------
+app.use(
+  "/api",
+  createProxyMiddleware({
+    target: API_UPSTREAM,
+    changeOrigin: true,
+    xfwd: true,
+    ws: true,
+    onProxyReq: setForwardedHost,
+    onError(err, _req, res) {
+      console.error("[api-proxy] error:", err?.message || err);
+      if (!res.headersSent) res.status(502);
+      res.end("Bad gateway (api)");
+    },
+  })
+);
 
 // ------------------------------------------------------
-// 🔥 /app/* → frontend COMO /shop/* (SIN redirect)
+// /app/* -> PLATAFORMA (admin)
+// Si tu plataforma en el upstream vive en "/", esto STRIPEA /app:
+//   /app/users -> /users
+// Si tu plataforma realmente vive en "/app" también, BORRÁ pathRewrite.
 // ------------------------------------------------------
-const appToShopProxy = createProxyMiddleware({
-  target: SHOP_UPSTREAM,
-  changeOrigin: true,
-  xfwd: true,
-  ws: true,
-
-  pathRewrite: (path) => {
-    // /app/cart -> /shop/cart
-    // /app      -> /shop/
-    const rest = path.replace(/^\/app/, "");
-    return rest ? `/shop${rest}` : "/shop/";
-  },
-
-  onProxyReq: setForwardedHost,
-
-  onError(err, _req, res) {
-    console.error("[app-proxy] error:", err?.message || err);
-    if (!res.headersSent) res.status(502);
-    res.end("Bad gateway (app)");
-  },
-});
-
-app.use("/app", appToShopProxy);
+app.use(
+  "/app",
+  createProxyMiddleware({
+    target: APP_UPSTREAM,
+    changeOrigin: true,
+    xfwd: true,
+    ws: true,
+    pathRewrite: (path) => path.replace(/^\/app/, "") || "/", // ✅ strip /app
+    onProxyReq: setForwardedHost,
+    onError(err, _req, res) {
+      console.error("[app-proxy] error:", err?.message || err);
+      if (!res.headersSent) res.status(502);
+      res.end("Bad gateway (app)");
+    },
+  })
+);
 
 // ------------------------------------------------------
-// /shop/* → frontend normal
+// /shop/* -> TIENDA
 // ------------------------------------------------------
-const shopProxy = createProxyMiddleware({
-  target: SHOP_UPSTREAM,
-  changeOrigin: true,
-  xfwd: true,
-  ws: true,
-  onProxyReq: setForwardedHost,
-  onError(err, _req, res) {
-    console.error("[shop-proxy] error:", err?.message || err);
-    if (!res.headersSent) res.status(502);
-    res.end("Bad gateway (shop)");
-  },
-});
-
-app.use("/shop", shopProxy);
-
-// ------------------------------------------------------
-// /api/* → api
-// ------------------------------------------------------
-const apiProxy = createProxyMiddleware({
-  target: API_UPSTREAM,
-  changeOrigin: true,
-  xfwd: true,
-  ws: true,
-  onProxyReq: setForwardedHost,
-  onError(err, _req, res) {
-    console.error("[api-proxy] error:", err?.message || err);
-    if (!res.headersSent) res.status(502);
-    res.end("Bad gateway (api)");
-  },
-});
-
-app.use("/api", apiProxy);
+app.use(
+  "/shop",
+  createProxyMiddleware({
+    target: SHOP_UPSTREAM,
+    changeOrigin: true,
+    xfwd: true,
+    ws: true,
+    onProxyReq: setForwardedHost,
+    onError(err, _req, res) {
+      console.error("[shop-proxy] error:", err?.message || err);
+      if (!res.headersSent) res.status(502);
+      res.end("Bad gateway (shop)");
+    },
+  })
+);
 
 // ------------------------------------------------------
-// root → frontend /shop (SIN redirect)
+// ROOT "/" -> TIENDA como "/shop/*" (sin redirect)
 // ------------------------------------------------------
-const rootToShopProxy = createProxyMiddleware({
-  target: SHOP_UPSTREAM,
-  changeOrigin: true,
-  xfwd: true,
-  ws: true,
-  onProxyReq: setForwardedHost,
-  pathRewrite: (path) => {
-    // "/" -> "/shop/"
-    // "/c/2" -> "/shop/c/2"
-    if (path === "/") return "/shop/";
-    return `/shop${path}`;
-  },
-  onError(err, _req, res) {
-    console.error("[root-proxy] error:", err?.message || err);
-    if (!res.headersSent) res.status(502);
-    res.end("Bad gateway (root)");
-  },
-});
-
-app.use("/", rootToShopProxy);
+app.use(
+  "/",
+  createProxyMiddleware({
+    target: SHOP_UPSTREAM,
+    changeOrigin: true,
+    xfwd: true,
+    ws: true,
+    onProxyReq: setForwardedHost,
+    pathRewrite: (path) => {
+      if (path === "/") return "/shop/";
+      return `/shop${path}`;
+    },
+    onError(err, _req, res) {
+      console.error("[root-proxy] error:", err?.message || err);
+      if (!res.headersSent) res.status(502);
+      res.end("Bad gateway (root)");
+    },
+  })
+);
 
 app.listen(PORT, () => {
   console.log(`✅ pos360-edge on :${PORT}`);
-  console.log(`   shop/app -> ${SHOP_UPSTREAM}`);
-  console.log(`   api      -> ${API_UPSTREAM}`);
+  console.log(`   shop  -> ${SHOP_UPSTREAM}`);
+  console.log(`   app   -> ${APP_UPSTREAM}`);
+  console.log(`   api   -> ${API_UPSTREAM}`);
 });
