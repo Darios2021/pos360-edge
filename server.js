@@ -1,28 +1,14 @@
-// src/server.js
-// ✅ COPY-PASTE FINAL DEFINITIVO (POS360-EDGE)
+// server.js
+// ✅ COPY-PASTE FINAL (POS360-EDGE) — FIX API HTML HIJACK + /public compat
 //
-// FIXES:
-// ✅ No filtra host interno srv-captain (preserva Host original)
-// ✅ /api/v1/* proxya a commerce-api (evita que te devuelva HTML)
-// ✅ OG/Twitter dinámicos:
-//    - /shop/product/:id => OG con nombre + imagen del producto
-//    - resto => branding genérico
-// ✅ Inyección en TODAS las rutas HTML (incluye /app)
-// ✅ Cache de branding + cache de producto
+// FIX:
+// ✅ No trata "*/*" como HTML (evita que XHR/axios reciba index.html)
+// ✅ /public/* NO se inyecta: se proxya a /api/v1/public/*
+// ✅ /api/v1/* proxya normal a commerce-api
+// ✅ OG de producto en /shop/product/:id (si endpoint devuelve JSON usable)
 //
 // Requiere deps:
 //   npm i http-proxy-middleware node-fetch
-//
-// ENV esperadas:
-//   PUBLIC_BASE_URL=https://sanjuantecnologia.com
-//   FRONTEND_INTERNAL=http://srv-captain--pos360-frontend
-//   FRONTEND_INDEX_PATH=/shop/              (o /shop)
-//   API_INTERNAL=http://srv-captain--pos360-commerce-api:3000   (RECOMENDADO)
-//   API_BASE=https://pos360-commerce-api.cingulado.org/api/v1   (fallback si no pones API_INTERNAL)
-//   BRANDING_ENDPOINT=/public/shop/branding   (o el tuyo real)
-//   PRODUCT_ENDPOINT=/public/products         (base endpoint)
-//   BRANDING_CACHE_SECONDS=60
-//   PRODUCT_CACHE_SECONDS=60
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
@@ -34,19 +20,18 @@ const PORT = Number(process.env.PORT || 3000);
 // ===== ENV =====
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || "https://sanjuantecnologia.com").replace(/\/+$/, "");
 
-// Frontend interno (CapRover service DNS interno)
 const FRONTEND_INTERNAL = String(process.env.FRONTEND_INTERNAL || "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
-const FRONTEND_INDEX_PATH = String(process.env.FRONTEND_INDEX_PATH || "/shop/").startsWith("/")
-  ? String(process.env.FRONTEND_INDEX_PATH || "/shop/")
-  : `/${String(process.env.FRONTEND_INDEX_PATH || "/shop/")}`;
+const FRONTEND_INDEX_PATH_RAW = String(process.env.FRONTEND_INDEX_PATH || "/shop/");
 
-// API: RECOMENDADO usar interno (evita TLS/host issues)
+const FRONTEND_INDEX_PATH = FRONTEND_INDEX_PATH_RAW.startsWith("/")
+  ? FRONTEND_INDEX_PATH_RAW
+  : `/${FRONTEND_INDEX_PATH_RAW}`;
+
 const API_INTERNAL = String(process.env.API_INTERNAL || "").trim().replace(/\/+$/, ""); // ej: http://srv-captain--pos360-commerce-api:3000
 const API_BASE = String(process.env.API_BASE || "https://pos360-commerce-api.cingulado.org/api/v1").replace(/\/+$/, "");
 
-// Endpoints públicos en tu API v1
 const BRANDING_ENDPOINT = String(process.env.BRANDING_ENDPOINT || "/public/shop/branding");
-const PRODUCT_ENDPOINT = String(process.env.PRODUCT_ENDPOINT || "/public/products"); // + /:id
+const PRODUCT_ENDPOINT = String(process.env.PRODUCT_ENDPOINT || "/public/products");
 
 const BRANDING_CACHE_SECONDS = Math.max(5, parseInt(process.env.BRANDING_CACHE_SECONDS || "60", 10) || 60);
 const PRODUCT_CACHE_SECONDS = Math.max(5, parseInt(process.env.PRODUCT_CACHE_SECONDS || "60", 10) || 60);
@@ -69,10 +54,10 @@ function absUrl(u) {
   return `${PUBLIC_BASE_URL}${s.startsWith("/") ? "" : "/"}${s}`;
 }
 
+// ✅ FIX CLAVE: SOLO HTML si Accept contiene text/html
 function wantsHtml(req) {
-  const accept = String(req.headers.accept || "");
-  // bots a veces mandan "*/*" o nada
-  return accept.includes("text/html") || accept.includes("*/*") || accept === "";
+  const a = String(req.headers.accept || "");
+  return a.includes("text/html");
 }
 
 function isAssetPath(p) {
@@ -87,7 +72,6 @@ function isAssetPath(p) {
 }
 
 function detectProductId(pathname) {
-  // /shop/product/303
   const m = String(pathname || "").match(/^\/shop\/product\/(\d+)(\/|$)/i);
   if (!m) return null;
   const n = Number(m[1]);
@@ -95,7 +79,6 @@ function detectProductId(pathname) {
 }
 
 function pickProductImage(prod) {
-  // intentamos varios formatos posibles
   const candidates = [
     prod?.og_image_url,
     prod?.image_url,
@@ -110,6 +93,7 @@ function pickProductImage(prod) {
     Array.isArray(prod?.images) ? (prod.images[0]?.url || prod.images[0]) : null,
     Array.isArray(prod?.product_images) ? (prod.product_images[0]?.url || prod.product_images[0]) : null,
   ];
+
   for (const c of candidates) {
     const v = String(c || "").trim();
     if (v) return absUrl(v);
@@ -130,19 +114,14 @@ function getCachedProduct(id) {
 }
 function setCachedProduct(id, data) {
   productCache.set(String(id), { at: Date.now(), data });
-  // limpieza simple
   if (productCache.size > 500) {
     const firstKey = productCache.keys().next().value;
     productCache.delete(firstKey);
   }
 }
 
-// ===== API fetchers =====
 async function apiFetchJson(url) {
-  const r = await fetch(url, {
-    headers: { Accept: "application/json" },
-    redirect: "follow",
-  });
+  const r = await fetch(url, { headers: { Accept: "application/json" }, redirect: "follow" });
   if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
   return await r.json();
 }
@@ -152,8 +131,7 @@ async function loadBranding() {
   if (cachedBranding && now - cachedBrandingAt < BRANDING_CACHE_SECONDS * 1000) return cachedBranding;
 
   try {
-    const url = `${API_BASE}${BRANDING_ENDPOINT}`;
-    const j = await apiFetchJson(url);
+    const j = await apiFetchJson(`${API_BASE}${BRANDING_ENDPOINT}`);
 
     const name = j?.name || "San Juan Tecnología";
     const favicon = absUrl(j?.favicon_url || "");
@@ -174,10 +152,7 @@ async function loadProduct(id) {
   if (cached) return cached;
 
   try {
-    const url = `${API_BASE}${PRODUCT_ENDPOINT}/${id}`;
-    const j = await apiFetchJson(url);
-
-    // normalizamos a "prod"
+    const j = await apiFetchJson(`${API_BASE}${PRODUCT_ENDPOINT}/${id}`);
     const prod = j?.item || j?.product || j;
 
     const data = {
@@ -197,34 +172,52 @@ async function loadProduct(id) {
 }
 
 // =========================
-// 0) Redirect home -> /shop
+// 0) HOME -> /shop
 // =========================
 app.get("/", (req, res) => res.redirect(301, "/shop/"));
 
 // =========================
-// 1) /api/v1 PROXY -> commerce-api
+// 1) ✅ COMPAT: /public/* -> /api/v1/public/*
+// (Porque tu frontend está pegando /public/catalog y hoy rompe)
 // =========================
 app.use(
-  "/api/v1",
+  "/public",
   createProxyMiddleware({
     target: API_INTERNAL || "https://pos360-commerce-api.cingulado.org",
-    changeOrigin: false, // ✅ CLAVE: preserva host original
+    changeOrigin: false,
     secure: true,
     ws: true,
-    pathRewrite: { "^/api/v1": "/api/v1" },
+    // /public/catalog  => /api/v1/public/catalog
+    pathRewrite: (pathReq) => `/api/v1${pathReq}`,
     onProxyReq: (proxyReq, req) => {
-      // ✅ fuerza headers forward
+      proxyReq.setHeader("Host", req.headers.host);
       proxyReq.setHeader("X-Forwarded-Host", req.headers.host);
       proxyReq.setHeader("X-Forwarded-Proto", "https");
-      proxyReq.setHeader("X-Forwarded-For", req.socket?.remoteAddress || "");
-      // si usas target interno HTTP, setea Host del request original
-      proxyReq.setHeader("Host", req.headers.host);
     },
   })
 );
 
 // =========================
-// 2) favicon.ico dinámico
+// 2) /api/v1/* -> commerce-api
+// =========================
+app.use(
+  "/api/v1",
+  createProxyMiddleware({
+    target: API_INTERNAL || "https://pos360-commerce-api.cingulado.org",
+    changeOrigin: false,
+    secure: true,
+    ws: true,
+    pathRewrite: { "^/api/v1": "/api/v1" },
+    onProxyReq: (proxyReq, req) => {
+      proxyReq.setHeader("Host", req.headers.host);
+      proxyReq.setHeader("X-Forwarded-Host", req.headers.host);
+      proxyReq.setHeader("X-Forwarded-Proto", "https");
+    },
+  })
+);
+
+// =========================
+// 3) favicon.ico dinámico
 // =========================
 app.get("/favicon.ico", async (req, res) => {
   const b = await loadBranding();
@@ -233,17 +226,20 @@ app.get("/favicon.ico", async (req, res) => {
 });
 
 // =========================
-// 3) HTML Injection (todas las rutas HTML)
+// 4) HTML Injection (solo navegación HTML real)
 // =========================
 app.get("*", async (req, res, next) => {
   try {
-    if (req.path.startsWith("/api/v1/")) return next();
+    // ✅ NO interceptar API ni compat
+    if (req.path.startsWith("/api/")) return next();
+    if (req.path.startsWith("/public/")) return next();
     if (isAssetPath(req.path)) return next();
+
+    // ✅ Solo HTML real (Accept: text/html)
     if (!wantsHtml(req)) return next();
 
     const productId = detectProductId(req.path);
 
-    // index base del frontend (siempre el mismo html)
     const indexUrl = `${FRONTEND_INTERNAL}${FRONTEND_INDEX_PATH}`;
     const [branding, indexRes, product] = await Promise.all([
       loadBranding(),
@@ -254,15 +250,12 @@ app.get("*", async (req, res, next) => {
     let html = await indexRes.text();
 
     const siteName = branding.name || "San Juan Tecnología";
-
     const canonical = `${PUBLIC_BASE_URL}${req.originalUrl || "/"}`;
 
-    // OG defaults
     let title = `${siteName} | Tienda`;
     let desc = "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas.";
     let ogImage = branding.ogImage || branding.favicon || `${PUBLIC_BASE_URL}/favicon.png`;
 
-    // ✅ producto real
     if (productId) {
       const pName = product?.name || `Producto #${productId}`;
       title = `${pName} | ${siteName}`;
@@ -318,25 +311,21 @@ app.get("*", async (req, res, next) => {
 });
 
 // =========================
-// 4) Proxy RESTO al frontend
+// 5) Proxy resto al frontend
 // =========================
 app.use(
   "/",
   createProxyMiddleware({
     target: FRONTEND_INTERNAL,
-    changeOrigin: false, // ✅ CLAVE: preserva host original
+    changeOrigin: false,
     ws: true,
     secure: true,
     onProxyReq: (proxyReq, req) => {
       proxyReq.setHeader("Host", req.headers.host);
       proxyReq.setHeader("X-Forwarded-Host", req.headers.host);
       proxyReq.setHeader("X-Forwarded-Proto", "https");
-      proxyReq.setHeader("X-Forwarded-For", req.socket?.remoteAddress || "");
     },
   })
 );
 
-// =========================
-// Final
-// =========================
 app.listen(PORT, () => console.log(`✅ pos360-edge on :${PORT}`));
