@@ -1,5 +1,11 @@
 /**
- * ✅ pos360-edge/server.js — COPY-PASTE FINAL (APP 500 debug friendly)
+ * ✅ pos360-edge/server.js — COPY-PASTE FINAL DEFINITIVO (FIX TypeError split)
+ * Reverse proxy por PATH:
+ * - /        -> /shop/
+ * - /shop*   -> TIENDA (sin strip)
+ * - /api/v1* -> API passthrough
+ * - /api*    -> alias => /api/v1/*
+ * - /app*    -> ADMIN (strip /app) + Location rewrite + Cookie Path=/app
  */
 
 const express = require("express");
@@ -13,39 +19,53 @@ function env(name, fallback) {
     ? String(v).trim()
     : fallback;
 }
+
 function mustEnv(name) {
   const v = env(name, "");
   if (!v) throw new Error(`Missing required env: ${name}`);
   return v;
 }
 
+function assertHttpUrl(name, value) {
+  if (!value) throw new Error(`Missing ${name}`);
+  if (!/^https?:\/\//i.test(value)) throw new Error(`${name} must start with http:// or https:// (${value})`);
+  return value;
+}
+
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 const LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
-const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend");
-const APP_UPSTREAM = env("APP_UPSTREAM", ""); // ✅ setearlo bien
-const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000");
+// ✅ Targets (strings SIEMPRE)
+const SHOP_UPSTREAM = assertHttpUrl("SHOP_UPSTREAM", env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend"));
+const APP_UPSTREAM = assertHttpUrl("APP_UPSTREAM", mustEnv("APP_UPSTREAM"));
+const API_ORIGIN = assertHttpUrl("API_ORIGIN", env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000"));
+
 const API_V1_TARGET = `${API_ORIGIN.replace(/\/$/, "")}/api/v1`;
 
 app.disable("x-powered-by");
 
+// ---------------- helpers ----------------
 function setForwardedHeaders(proxyReq, req, extra = {}) {
   proxyReq.setHeader("X-Forwarded-Host", req.headers.host || "");
-  proxyReq.setHeader(
-    "X-Forwarded-Proto",
-    req.headers["x-forwarded-proto"] || req.protocol || "https"
-  );
+  proxyReq.setHeader("X-Forwarded-Proto", req.headers["x-forwarded-proto"] || req.protocol || "https");
   proxyReq.setHeader("X-Real-IP", req.headers["x-real-ip"] || req.ip || "");
   proxyReq.setHeader("X-Forwarded-For", req.headers["x-forwarded-for"] || req.ip || "");
   Object.entries(extra).forEach(([k, v]) => proxyReq.setHeader(k, v));
 }
 
 function proxyError(where) {
-  return (err, req, res) => {
+  return (err, _req, res) => {
     console.error(`[${where}] proxy error:`, err?.message || err);
     if (!res.headersSent) res.status(502);
     res.end(`Bad gateway (${where})`);
   };
+}
+
+function normalizeShopLocation(proxyRes) {
+  const loc = proxyRes.headers?.location;
+  if (!loc || typeof loc !== "string") return;
+  if (loc === "/shop") proxyRes.headers.location = "/shop/";
+  if (loc === "/shop//") proxyRes.headers.location = "/shop/";
 }
 
 function rewriteLocationToApp(proxyRes) {
@@ -58,29 +78,32 @@ function rewriteLocationToApp(proxyRes) {
 function rewriteSetCookiePathToApp(proxyRes) {
   const sc = proxyRes.headers["set-cookie"];
   if (!sc) return;
-  const fix = (cookie) =>
-    cookie.replace(/;\s*Path=\/(\s*;|$)/i, "; Path=/app$1");
+
+  const fix = (cookie) => cookie.replace(/;\s*Path=\/(\s*;|$)/i, "; Path=/app$1");
+
   if (Array.isArray(sc)) proxyRes.headers["set-cookie"] = sc.map(fix);
   else if (typeof sc === "string") proxyRes.headers["set-cookie"] = fix(sc);
 }
 
+// ---------------- health ----------------
 app.get("/health", (_req, res) =>
   res.status(200).json({
     ok: true,
     service: "pos360-edge",
     shop: SHOP_UPSTREAM,
-    app: APP_UPSTREAM || "(missing)",
+    app: APP_UPSTREAM,
     api: API_V1_TARGET,
   })
 );
 
+// root
 app.get("/", (_req, res) => res.redirect(301, "/shop/"));
 
-// ✅ API passthrough
+// ---------------- /api/v1 passthrough ----------------
 app.use(
   "/api/v1",
   createProxyMiddleware({
-    target: API_ORIGIN,
+    target: API_ORIGIN, // mantiene /api/v1 intacto
     changeOrigin: true,
     xfwd: true,
     ws: true,
@@ -92,7 +115,7 @@ app.use(
   })
 );
 
-// ✅ API alias
+// ---------------- /api alias -> /api/v1 ----------------
 app.use(
   "/api",
   createProxyMiddleware({
@@ -109,36 +132,28 @@ app.use(
   })
 );
 
-// ✅ Admin
-app.use("/app", (req, res, next) => {
-  if (!APP_UPSTREAM) {
-    return res
-      .status(500)
-      .send("EDGE misconfig: missing APP_UPSTREAM env (needed for /app*)");
-  }
-  return next();
-});
-
+// ---------------- /app -> admin ----------------
 app.use(
   "/app",
   createProxyMiddleware({
-    target: () => mustEnv("APP_UPSTREAM"),
+    target: APP_UPSTREAM,
     changeOrigin: true,
     xfwd: true,
     ws: true,
     logLevel: LOG_LEVEL,
 
+    // strip /app al upstream
     pathRewrite: (path) => path.replace(/^\/app/, "") || "/",
 
     onProxyReq(proxyReq, req) {
       setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/app" });
+
+      // ✅ evita validaciones raras de host en algunos servers
+      // (si te rompe, lo sacás)
+      proxyReq.setHeader("Host", new URL(APP_UPSTREAM).host);
     },
 
-    onProxyRes(proxyRes, req, res) {
-      // Si el upstream devuelve 500, te lo dejamos logueado
-      if (proxyRes.statusCode >= 500) {
-        console.error(`[app] upstream status ${proxyRes.statusCode} for ${req.method} ${req.originalUrl}`);
-      }
+    onProxyRes(proxyRes) {
       rewriteLocationToApp(proxyRes);
       rewriteSetCookiePathToApp(proxyRes);
     },
@@ -147,7 +162,7 @@ app.use(
   })
 );
 
-// ✅ Shop
+// ---------------- /shop -> frontend ----------------
 app.use(
   "/shop",
   createProxyMiddleware({
@@ -158,16 +173,21 @@ app.use(
     logLevel: LOG_LEVEL,
     onProxyReq(proxyReq, req) {
       setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/shop" });
+      proxyReq.setHeader("Host", new URL(SHOP_UPSTREAM).host);
+    },
+    onProxyRes(proxyRes) {
+      normalizeShopLocation(proxyRes);
     },
     onError: proxyError("shop"),
   })
 );
 
+// fallback
 app.use((req, res) => res.redirect(301, "/shop/"));
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ pos360-edge on :${PORT}`);
-  console.log(`   shop -> ${SHOP_UPSTREAM}`);
-  console.log(`   app  -> ${APP_UPSTREAM || "(missing)"}`);
-  console.log(`   api  -> ${API_V1_TARGET}`);
+  console.log(`shop -> ${SHOP_UPSTREAM}`);
+  console.log(`app  -> ${APP_UPSTREAM}`);
+  console.log(`api  -> ${API_V1_TARGET}`);
 });
