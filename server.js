@@ -1,17 +1,22 @@
 /**
- * ✅ pos360-edge/server.js — COPY-PASTE FINAL DEFINITIVO (FIX TypeError split)
+ * ✅ pos360-edge/server.js  (COPY-PASTE FINAL COMPLETO)
+ *
  * Reverse proxy por PATH:
- * - /        -> /shop/
- * - /shop*   -> TIENDA (sin strip)
- * - /api/v1* -> API passthrough
- * - /api*    -> alias => /api/v1/*
- * - /app*    -> ADMIN (strip /app) + Location rewrite + Cookie Path=/app
+ * - /        -> TIENDA (shop)
+ * - /shop/*  -> TIENDA
+ * - /app/*   -> PLATAFORMA (admin/backoffice) ✅ strip /app + reescritura Location/Cookies
+ * - /api/*   -> API
+ *
+ * FIX CRÍTICO:
+ * - Eliminado target dinámico / router que estaba apuntando a "sanjuantecnologia.com" (sin protocolo)
+ *   y rompía requires-port (protocol undefined -> split).
  */
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
+app.set("trust proxy", true);
 
 function env(name, fallback) {
   const v = process.env[name];
@@ -20,174 +25,139 @@ function env(name, fallback) {
     : fallback;
 }
 
-function mustEnv(name) {
-  const v = env(name, "");
-  if (!v) throw new Error(`Missing required env: ${name}`);
-  return v;
+// ✅ Normaliza: si falta protocolo, asume http://
+function normalizeUrl(raw, fallback) {
+  const v = env(raw, fallback);
+  if (!v) return v;
+  if (/^https?:\/\//i.test(v)) return v;
+  return `http://${v}`;
 }
 
-function assertHttpUrl(name, value) {
-  if (!value) throw new Error(`Missing ${name}`);
-  if (!/^https?:\/\//i.test(value)) throw new Error(`${name} must start with http:// or https:// (${value})`);
-  return value;
+function envInt(name, fallback) {
+  const v = parseInt(env(name, String(fallback)), 10);
+  return Number.isFinite(v) ? v : fallback;
 }
 
-const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
-const LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
+const PORT = envInt("PORT", 3000);
+const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
-// ✅ Targets (strings SIEMPRE)
-const SHOP_UPSTREAM = assertHttpUrl("SHOP_UPSTREAM", env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend"));
-const APP_UPSTREAM = assertHttpUrl("APP_UPSTREAM", mustEnv("APP_UPSTREAM"));
-const API_ORIGIN = assertHttpUrl("API_ORIGIN", env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000"));
+// 🔗 Upstreams internos (CapRover service names)
+const SHOP_UPSTREAM = normalizeUrl("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend");
+const APP_UPSTREAM  = normalizeUrl("APP_UPSTREAM",  "http://srv-captain--pos360-admin:80");
+const API_UPSTREAM  = normalizeUrl("API_UPSTREAM",  "http://srv-captain--pos360-commerce-api:3000/api/v1");
 
-const API_V1_TARGET = `${API_ORIGIN.replace(/\/$/, "")}/api/v1`;
+// Base pública (solo para logs / debugging)
+const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com");
 
-app.disable("x-powered-by");
+console.log(`✅ pos360-edge on :${PORT}`);
+console.log(`shop -> ${SHOP_UPSTREAM}`);
+console.log(`app  -> ${APP_UPSTREAM}`);
+console.log(`api  -> ${API_UPSTREAM}`);
 
-// ---------------- helpers ----------------
-function setForwardedHeaders(proxyReq, req, extra = {}) {
-  proxyReq.setHeader("X-Forwarded-Host", req.headers.host || "");
-  proxyReq.setHeader("X-Forwarded-Proto", req.headers["x-forwarded-proto"] || req.protocol || "https");
-  proxyReq.setHeader("X-Real-IP", req.headers["x-real-ip"] || req.ip || "");
-  proxyReq.setHeader("X-Forwarded-For", req.headers["x-forwarded-for"] || req.ip || "");
-  Object.entries(extra).forEach(([k, v]) => proxyReq.setHeader(k, v));
+// ===== Helpers de reescritura =====
+function rewriteLocationToApp(proxyRes) {
+  const loc = proxyRes.headers?.location;
+  if (!loc) return;
+
+  // 1) Redirect relativo "/auth" => "/app/auth"
+  if (loc.startsWith("/") && !loc.startsWith("/app/") && loc !== "/app") {
+    proxyRes.headers.location = `/app${loc}`;
+    return;
+  }
+
+  // 2) Redirect absoluto a APP_UPSTREAM => convertir a "/app/..."
+  //    Ej: "http://srv-captain--pos360-admin/auth" -> "/app/auth"
+  try {
+    const u = new URL(loc);
+    const appOrigin = new URL(APP_UPSTREAM).origin;
+
+    if (u.origin === appOrigin) {
+      const newPath = u.pathname + (u.search || "") + (u.hash || "");
+      proxyRes.headers.location = `/app${newPath}`;
+    }
+  } catch (_) {
+    // si no es URL válida, no tocar
+  }
 }
 
-function proxyError(where) {
-  return (err, _req, res) => {
-    console.error(`[${where}] proxy error:`, err?.message || err);
-    if (!res.headersSent) res.status(502);
-    res.end(`Bad gateway (${where})`);
+function onProxyError(label) {
+  return (err, req, res) => {
+    console.error(`❌ Proxy error [${label}] ${req.method} ${req.originalUrl}:`, err?.message || err);
+
+    if (res.headersSent) return;
+    res.status(502).send(`Bad gateway (${label})`);
   };
 }
 
-function normalizeShopLocation(proxyRes) {
-  const loc = proxyRes.headers?.location;
-  if (!loc || typeof loc !== "string") return;
-  if (loc === "/shop") proxyRes.headers.location = "/shop/";
-  if (loc === "/shop//") proxyRes.headers.location = "/shop/";
-}
+// ===== Root: manda a shop (opcional) =====
+app.get("/", (req, res) => {
+  res.redirect("/shop");
+});
 
-function rewriteLocationToApp(proxyRes) {
-  const loc = proxyRes.headers?.location;
-  if (!loc || typeof loc !== "string") return;
-  if (loc.startsWith("/app/") || loc === "/app") return;
-  if (loc.startsWith("/")) proxyRes.headers.location = "/app" + loc;
-}
-
-function rewriteSetCookiePathToApp(proxyRes) {
-  const sc = proxyRes.headers["set-cookie"];
-  if (!sc) return;
-
-  const fix = (cookie) => cookie.replace(/;\s*Path=\/(\s*;|$)/i, "; Path=/app$1");
-
-  if (Array.isArray(sc)) proxyRes.headers["set-cookie"] = sc.map(fix);
-  else if (typeof sc === "string") proxyRes.headers["set-cookie"] = fix(sc);
-}
-
-// ---------------- health ----------------
-app.get("/health", (_req, res) =>
-  res.status(200).json({
-    ok: true,
-    service: "pos360-edge",
-    shop: SHOP_UPSTREAM,
-    app: APP_UPSTREAM,
-    api: API_V1_TARGET,
-  })
-);
-
-// root
-app.get("/", (_req, res) => res.redirect(301, "/shop/"));
-
-// ---------------- /api/v1 passthrough ----------------
-app.use(
-  "/api/v1",
-  createProxyMiddleware({
-    target: API_ORIGIN, // mantiene /api/v1 intacto
-    changeOrigin: true,
-    xfwd: true,
-    ws: true,
-    logLevel: LOG_LEVEL,
-    onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req);
-    },
-    onError: proxyError("api-v1"),
-  })
-);
-
-// ---------------- /api alias -> /api/v1 ----------------
+// ===== /api => API =====
 app.use(
   "/api",
   createProxyMiddleware({
-    target: API_V1_TARGET,
+    target: API_UPSTREAM,
     changeOrigin: true,
     xfwd: true,
-    ws: true,
-    logLevel: LOG_LEVEL,
-    pathRewrite: (path) => path.replace(/^\/api/, "") || "/",
-    onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req);
-    },
-    onError: proxyError("api"),
+    logLevel: PROXY_LOG_LEVEL,
+    // /api/* -> API_UPSTREAM/*  (si tu API_UPSTREAM ya incluye /api/v1)
+    pathRewrite: (path) => path.replace(/^\/api/, ""),
+    onError: onProxyError("api"),
   })
 );
 
-// ---------------- /app -> admin ----------------
+// ===== /app => ADMIN =====
 app.use(
   "/app",
   createProxyMiddleware({
     target: APP_UPSTREAM,
     changeOrigin: true,
     xfwd: true,
-    ws: true,
-    logLevel: LOG_LEVEL,
+    logLevel: PROXY_LOG_LEVEL,
 
-    // strip /app al upstream
-    pathRewrite: (path) => path.replace(/^\/app/, "") || "/",
+    // /app/* -> APP_UPSTREAM/*
+    pathRewrite: (path) => path.replace(/^\/app/, ""),
 
-    onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/app" });
-
-      // ✅ evita validaciones raras de host en algunos servers
-      // (si te rompe, lo sacás)
-      proxyReq.setHeader("Host", new URL(APP_UPSTREAM).host);
-    },
-
-    onProxyRes(proxyRes) {
+    // ✅ reescribir redirects y cookies para quedar bajo /app
+    onProxyRes: (proxyRes) => {
       rewriteLocationToApp(proxyRes);
-      rewriteSetCookiePathToApp(proxyRes);
+
+      // cookies: Path=/  -> Path=/app
+      // (algunas apps usan Path=/; esto evita que "pise" la tienda)
+      if (proxyRes.headers["set-cookie"]) {
+        proxyRes.headers["set-cookie"] = proxyRes.headers["set-cookie"].map((c) =>
+          c.replace(/;\s*Path=\/(\s*|;|$)/i, "; Path=/app$1")
+        );
+      }
     },
 
-    onError: proxyError("app"),
+    onError: onProxyError("app"),
   })
 );
 
-// ---------------- /shop -> frontend ----------------
+// ===== /shop (y fallback) => SHOP =====
 app.use(
-  "/shop",
+  ["/shop", "/shop/*"],
   createProxyMiddleware({
     target: SHOP_UPSTREAM,
     changeOrigin: true,
     xfwd: true,
-    ws: true,
-    logLevel: LOG_LEVEL,
-    onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/shop" });
-      proxyReq.setHeader("Host", new URL(SHOP_UPSTREAM).host);
-    },
-    onProxyRes(proxyRes) {
-      normalizeShopLocation(proxyRes);
-    },
-    onError: proxyError("shop"),
+    logLevel: PROXY_LOG_LEVEL,
+    onError: onProxyError("shop"),
   })
 );
 
-// fallback
-app.use((req, res) => res.redirect(301, "/shop/"));
+// ✅ Fallback: cualquier otra cosa se va a SHOP (evita 404 raros)
+app.use(
+  createProxyMiddleware({
+    target: SHOP_UPSTREAM,
+    changeOrigin: true,
+    xfwd: true,
+    logLevel: PROXY_LOG_LEVEL,
+    onError: onProxyError("fallback"),
+  })
+);
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ pos360-edge on :${PORT}`);
-  console.log(`shop -> ${SHOP_UPSTREAM}`);
-  console.log(`app  -> ${APP_UPSTREAM}`);
-  console.log(`api  -> ${API_V1_TARGET}`);
-});
+app.listen(PORT, "0.0.0.0");
