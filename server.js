@@ -1,15 +1,11 @@
 /**
- * ✅ pos360-edge/server.js — COPY-PASTE FINAL (FIX redirects host interno)
+ * ✅ pos360-edge/server.js — COPY-PASTE FINAL (FIX redirects to internal host)
  * Reverse proxy por PATH:
  * - /        -> /shop/
- * - /shop*   -> TIENDA (sin strip)
- * - /api/v1* -> API passthrough
+ * - /shop*   -> TIENDA (sin strip)   ✅ NO fuerza Host interno (evita Location srv-captain)
+ * - /api/v1* -> API passthrough      (Host interno OK)
  * - /api*    -> alias => /api/v1/*
  * - /app*    -> ADMIN (strip /app) + Location rewrite + Cookie Path=/app
- *
- * Fix:
- * - ✅ NO forzar Host=svc interno (evita Location: http://srv-captain--...)
- * - ✅ APP_UPSTREAM se usa (admin real)
  */
 
 const express = require("express");
@@ -44,22 +40,29 @@ function asUrl(name, raw) {
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 const LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
-const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com").replace(/\/+$/, "");
+// ✅ PUBLIC_BASE_URL: se usa para reescritura de Location absoluto
+const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "");
 
-const SHOP_UPSTREAM = asUrl(
+// ✅ Targets
+const SHOP_UPSTREAM_RAW = normalizeHttpUrl(
   "SHOP_UPSTREAM",
-  normalizeHttpUrl("SHOP_UPSTREAM", env("SHOP_UPSTREAM"), "http://srv-captain--pos360-frontend")
+  env("SHOP_UPSTREAM"),
+  "http://srv-captain--pos360-frontend"
 );
-
-const APP_UPSTREAM = asUrl(
+const APP_UPSTREAM_RAW = normalizeHttpUrl(
   "APP_UPSTREAM",
-  normalizeHttpUrl("APP_UPSTREAM", env("APP_UPSTREAM"), "http://srv-captain--pos360-admin")
+  env("APP_UPSTREAM"),
+  "http://srv-captain--pos360-admin:80"
+);
+const API_ORIGIN_RAW = normalizeHttpUrl(
+  "API_ORIGIN",
+  env("API_ORIGIN"),
+  "http://srv-captain--pos360-commerce-api:3000"
 );
 
-const API_ORIGIN = asUrl(
-  "API_ORIGIN",
-  normalizeHttpUrl("API_ORIGIN", env("API_ORIGIN"), "http://srv-captain--pos360-commerce-api:3000")
-);
+const SHOP_UPSTREAM = asUrl("SHOP_UPSTREAM", SHOP_UPSTREAM_RAW);
+const APP_UPSTREAM = asUrl("APP_UPSTREAM", APP_UPSTREAM_RAW);
+const API_ORIGIN = asUrl("API_ORIGIN", API_ORIGIN_RAW);
 
 const API_V1_TARGET = new URL("/api/v1", API_ORIGIN);
 
@@ -88,6 +91,30 @@ function normalizeShopLocation(proxyRes) {
   if (loc === "/shop//") proxyRes.headers.location = "/shop/";
 }
 
+/**
+ * ✅ Reescribe Location absolutos internos => PUBLIC_BASE_URL
+ * Ej: http://srv-captain--pos360-frontend/shop/  -> https://sanjuantecnologia.com/shop/
+ */
+function rewriteAbsoluteLocation(proxyRes) {
+  const loc = proxyRes.headers?.location;
+  if (!loc || typeof loc !== "string") return;
+  if (!PUBLIC_BASE_URL) return;
+
+  // Reescribe si viene con host interno del shop/app
+  const candidates = [
+    SHOP_UPSTREAM.origin,
+    APP_UPSTREAM.origin,
+    API_ORIGIN.origin,
+  ];
+
+  for (const origin of candidates) {
+    if (loc.startsWith(origin)) {
+      proxyRes.headers.location = PUBLIC_BASE_URL.replace(/\/+$/, "") + loc.slice(origin.length);
+      return;
+    }
+  }
+}
+
 function rewriteLocationToApp(proxyRes) {
   const loc = proxyRes.headers?.location;
   if (!loc || typeof loc !== "string") return;
@@ -106,32 +133,6 @@ function rewriteSetCookiePathToApp(proxyRes) {
   else if (typeof sc === "string") proxyRes.headers["set-cookie"] = fix(sc);
 }
 
-function rewriteLocationToPublic(proxyRes, publicBaseUrl, upstreamUrl) {
-  const loc = proxyRes.headers?.location;
-  if (!loc || typeof loc !== "string") return;
-
-  // relative -> no tocar
-  if (loc.startsWith("/")) return;
-
-  // absolute al upstream interno -> pasarlo a público
-  if (loc.startsWith(upstreamUrl.origin)) {
-    proxyRes.headers.location = publicBaseUrl + loc.slice(upstreamUrl.origin.length);
-    return;
-  }
-
-  // http al host público -> forzar https
-  if (loc.startsWith("http://")) {
-    try {
-      const u = new URL(loc);
-      const pub = new URL(publicBaseUrl);
-      if (u.host === pub.host) {
-        u.protocol = "https:";
-        proxyRes.headers.location = u.toString();
-      }
-    } catch {}
-  }
-}
-
 // ---------------- health ----------------
 app.get("/health", (_req, res) =>
   res.status(200).json({
@@ -140,30 +141,33 @@ app.get("/health", (_req, res) =>
     shop: SHOP_UPSTREAM.href,
     app: APP_UPSTREAM.href,
     api: API_V1_TARGET.href,
-    publicBase: PUBLIC_BASE_URL,
+    publicBase: PUBLIC_BASE_URL || null,
   })
 );
 
 // root
 app.get("/", (_req, res) => res.redirect(301, "/shop/"));
 
-// ---------------- /api/v1 ----------------
+// ---------------- /api/v1 passthrough ----------------
 app.use(
   "/api/v1",
   createProxyMiddleware({
     target: API_ORIGIN,
-    changeOrigin: true,
+    changeOrigin: true, // ✅ acá OK
     xfwd: true,
     logLevel: LOG_LEVEL,
     onProxyReq(proxyReq, req) {
       setForwardedHeaders(proxyReq, req);
-      // API normalmente no necesita Host público, lo dejamos al target por changeOrigin
+      proxyReq.setHeader("Host", API_ORIGIN.host); // ✅ API puede quedar interno
+    },
+    onProxyRes(proxyRes) {
+      rewriteAbsoluteLocation(proxyRes);
     },
     onError: proxyError("api-v1"),
   })
 );
 
-// ---------------- /api -> /api/v1 ----------------
+// ---------------- /api alias -> /api/v1 ----------------
 app.use(
   "/api",
   createProxyMiddleware({
@@ -174,6 +178,10 @@ app.use(
     pathRewrite: (p) => p.replace(/^\/api/, "") || "/",
     onProxyReq(proxyReq, req) {
       setForwardedHeaders(proxyReq, req);
+      proxyReq.setHeader("Host", API_ORIGIN.host);
+    },
+    onProxyRes(proxyRes) {
+      rewriteAbsoluteLocation(proxyRes);
     },
     onError: proxyError("api"),
   })
@@ -184,21 +192,27 @@ app.use(
   "/app",
   createProxyMiddleware({
     target: APP_UPSTREAM,
-    changeOrigin: true,
+
+    // ✅ CLAVE: no fuerces host interno => evita Location srv-captain en redirects
+    changeOrigin: false,
     xfwd: true,
     logLevel: LOG_LEVEL,
+
     pathRewrite: (p) => p.replace(/^\/app/, "") || "/",
+
     onProxyReq(proxyReq, req) {
       setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/app" });
 
-      // ✅ CLAVE: Host público (evita redirects a srv-captain--)
+      // ✅ CLAVE: mantener host público
       if (req.headers.host) proxyReq.setHeader("Host", req.headers.host);
     },
+
     onProxyRes(proxyRes) {
       rewriteLocationToApp(proxyRes);
       rewriteSetCookiePathToApp(proxyRes);
-      rewriteLocationToPublic(proxyRes, PUBLIC_BASE_URL, APP_UPSTREAM);
+      rewriteAbsoluteLocation(proxyRes);
     },
+
     onError: proxyError("app"),
   })
 );
@@ -208,30 +222,35 @@ app.use(
   "/shop",
   createProxyMiddleware({
     target: SHOP_UPSTREAM,
-    changeOrigin: true,
+
+    // ✅ CLAVE: no fuerces host interno => evita Location srv-captain en redirects
+    changeOrigin: false,
     xfwd: true,
     logLevel: LOG_LEVEL,
+
     onProxyReq(proxyReq, req) {
       setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/shop" });
 
-      // ✅ CLAVE: Host público (evita Location: http://srv-captain--...)
+      // ✅ CLAVE: mantener host público
       if (req.headers.host) proxyReq.setHeader("Host", req.headers.host);
     },
+
     onProxyRes(proxyRes) {
       normalizeShopLocation(proxyRes);
-      rewriteLocationToPublic(proxyRes, PUBLIC_BASE_URL, SHOP_UPSTREAM);
+      rewriteAbsoluteLocation(proxyRes);
     },
+
     onError: proxyError("shop"),
   })
 );
 
 // fallback
-app.use((_req, res) => res.redirect(301, "/shop/"));
+app.use((req, res) => res.redirect(301, "/shop/"));
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ pos360-edge on :${PORT}`);
   console.log(`shop -> ${SHOP_UPSTREAM.href}`);
   console.log(`app  -> ${APP_UPSTREAM.href}`);
   console.log(`api  -> ${API_V1_TARGET.href}`);
-  console.log(`public -> ${PUBLIC_BASE_URL}`);
+  console.log(`public -> ${PUBLIC_BASE_URL || "(not set)"}`);
 });
