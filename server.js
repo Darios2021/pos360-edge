@@ -1,10 +1,10 @@
 /**
- * ✅ pos360-edge/server.js — COPY-PASTE FINAL (FIX redirect loop /shop)
+ * ✅ pos360-edge/server.js — COPY-PASTE FINAL (FIX LOOP /shop)
  * Reverse proxy por PATH:
  * - /        -> /shop/
- * - /shop/*  -> TIENDA (sin strip, porque el frontend redirige / -> /shop/)
- * - /app/*   -> PLATAFORMA (admin/backoffice) ✅ reescribe Location: /auth -> /app/auth
- * - /api/*   -> API => /api/v1/*
+ * - /shop*   -> TIENDA (sin strip)
+ * - /app*    -> PLATAFORMA (admin) (strip /app) + reescribe Location
+ * - /api*    -> API => /api/v1/*
  */
 
 const express = require("express");
@@ -28,19 +28,15 @@ function mustEnv(name) {
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 const LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
-// 🔗 Upstreams internos
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend");
-const APP_UPSTREAM = env("APP_UPSTREAM", ""); // requerido para /app/*
+const APP_UPSTREAM = env("APP_UPSTREAM", "");
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000");
 
-// ✅ API real = /api/v1
 const API_V1_TARGET = `${API_ORIGIN.replace(/\/$/, "")}/api/v1`;
 
 app.disable("x-powered-by");
 
-// ------------------------------------------------------
-// Helpers
-// ------------------------------------------------------
+// -------------------- helpers --------------------
 function setForwardedHeaders(proxyReq, req, extra = {}) {
   proxyReq.setHeader("X-Forwarded-Host", req.headers.host || "");
   proxyReq.setHeader(
@@ -60,6 +56,15 @@ function proxyError(where) {
   };
 }
 
+function normalizeShopLocation(proxyRes) {
+  // Corta el ping-pong /shop <-> /shop/
+  const loc = proxyRes.headers?.location;
+  if (!loc || typeof loc !== "string") return;
+
+  if (loc === "/shop") proxyRes.headers.location = "/shop/";
+  if (loc === "/shop//") proxyRes.headers.location = "/shop/";
+}
+
 function rewriteLocationToApp(proxyRes) {
   const loc = proxyRes.headers?.location;
   if (!loc || typeof loc !== "string") return;
@@ -71,9 +76,7 @@ function rewriteLocationToApp(proxyRes) {
   }
 }
 
-// ------------------------------------------------------
-// HEALTH
-// ------------------------------------------------------
+// -------------------- health --------------------
 app.get("/health", (_req, res) =>
   res.status(200).json({
     ok: true,
@@ -84,17 +87,10 @@ app.get("/health", (_req, res) =>
   })
 );
 
-// ------------------------------------------------------
-// ROOT
-// ------------------------------------------------------
+// ✅ SOLO root redirige. (NO redirect /shop ni /app para evitar loops)
 app.get("/", (_req, res) => res.redirect(301, "/shop/"));
-app.get("/shop", (_req, res) => res.redirect(301, "/shop/"));
-app.get("/app", (_req, res) => res.redirect(301, "/app/"));
 
-// ------------------------------------------------------
-// /api/* -> API (/api => /api/v1)
-// Ej: /api/public/catalog -> http://api:3000/api/v1/public/catalog
-// ------------------------------------------------------
+// -------------------- /api* -> /api/v1* --------------------
 app.use(
   "/api",
   createProxyMiddleware({
@@ -114,15 +110,12 @@ app.use(
   })
 );
 
-// ------------------------------------------------------
-// /app/* -> ADMIN (STRIP /app)
-// + reescribe redirects Location: /x => /app/x
-// ------------------------------------------------------
+// -------------------- /app* -> admin --------------------
 app.use("/app", (req, res, next) => {
   if (!APP_UPSTREAM) {
     return res
       .status(500)
-      .send("EDGE misconfig: missing APP_UPSTREAM env (needed for /app/*)");
+      .send("EDGE misconfig: missing APP_UPSTREAM env (needed for /app*)");
   }
   return next();
 });
@@ -144,24 +137,14 @@ app.use(
 
     onProxyRes(proxyRes) {
       rewriteLocationToApp(proxyRes);
-
-      // Si necesitás cookies scoped a /app, descomentá:
-      // const sc = proxyRes.headers["set-cookie"];
-      // if (Array.isArray(sc)) {
-      //   proxyRes.headers["set-cookie"] = sc.map((c) =>
-      //     c.replace(/;\s*Path=\/(\s*;|$)/i, "; Path=/app$1")
-      //   );
-      // }
     },
 
     onError: proxyError("app"),
   })
 );
 
-// ------------------------------------------------------
-// /shop/* -> FRONT
-// ✅ NO STRIP /shop (porque tu frontend ya está armado para vivir bajo /shop)
-// ------------------------------------------------------
+// -------------------- /shop* -> frontend --------------------
+// ✅ SIN STRIP /shop para evitar loop con tu frontend (que vive bajo /shop)
 app.use(
   "/shop",
   createProxyMiddleware({
@@ -171,22 +154,20 @@ app.use(
     ws: true,
     logLevel: LOG_LEVEL,
 
-    // 👇 NO pathRewrite acá (evita loop / -> /shop/)
     onProxyReq(proxyReq, req) {
       setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/shop" });
+    },
+
+    onProxyRes(proxyRes) {
+      normalizeShopLocation(proxyRes);
     },
 
     onError: proxyError("shop"),
   })
 );
 
-// ------------------------------------------------------
-// Todo lo que no sea /api o /app o /shop => mandalo a /shop/ (redir)
-// (evita que assets sueltos te entren a loops raros)
-// ------------------------------------------------------
-app.use((req, res) => {
-  return res.redirect(301, "/shop/");
-});
+// -------------------- fallback --------------------
+app.use((req, res) => res.redirect(301, "/shop/"));
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ pos360-edge on :${PORT}`);
