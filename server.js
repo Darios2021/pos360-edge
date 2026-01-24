@@ -1,10 +1,10 @@
 /**
- * ✅ pos360-edge/server.js — COPY-PASTE FINAL DEFINITIVO
+ * ✅ pos360-edge/server.js — COPY-PASTE FINAL (FIX redirect loop /shop)
  * Reverse proxy por PATH:
  * - /        -> /shop/
- * - /shop/*  -> TIENDA
- * - /app/*   -> PLATAFORMA (admin/backoffice)  ✅ reescribe Location: /auth -> /app/auth
- * - /api/*   -> API => mapea a /api/v1/*
+ * - /shop/*  -> TIENDA (sin strip, porque el frontend redirige / -> /shop/)
+ * - /app/*   -> PLATAFORMA (admin/backoffice) ✅ reescribe Location: /auth -> /app/auth
+ * - /api/*   -> API => /api/v1/*
  */
 
 const express = require("express");
@@ -43,7 +43,10 @@ app.disable("x-powered-by");
 // ------------------------------------------------------
 function setForwardedHeaders(proxyReq, req, extra = {}) {
   proxyReq.setHeader("X-Forwarded-Host", req.headers.host || "");
-  proxyReq.setHeader("X-Forwarded-Proto", req.headers["x-forwarded-proto"] || req.protocol || "https");
+  proxyReq.setHeader(
+    "X-Forwarded-Proto",
+    req.headers["x-forwarded-proto"] || req.protocol || "https"
+  );
   proxyReq.setHeader("X-Real-IP", req.headers["x-real-ip"] || req.ip || "");
   proxyReq.setHeader("X-Forwarded-For", req.headers["x-forwarded-for"] || req.ip || "");
   Object.entries(extra).forEach(([k, v]) => proxyReq.setHeader(k, v));
@@ -61,10 +64,8 @@ function rewriteLocationToApp(proxyRes) {
   const loc = proxyRes.headers?.location;
   if (!loc || typeof loc !== "string") return;
 
-  // si ya viene con /app, no tocar
   if (loc.startsWith("/app/") || loc === "/app") return;
 
-  // solo rutas absolutas del mismo host
   if (loc.startsWith("/")) {
     proxyRes.headers.location = "/app" + loc;
   }
@@ -103,7 +104,6 @@ app.use(
     ws: true,
     logLevel: LOG_LEVEL,
 
-    // ✅ sacamos /api y dejamos el resto
     pathRewrite: (path) => path.replace(/^\/api/, "") || "/",
 
     onProxyReq(proxyReq, req) {
@@ -136,7 +136,6 @@ app.use(
     ws: true,
     logLevel: LOG_LEVEL,
 
-    // ✅ hacia el upstream sacamos el prefijo /app
     pathRewrite: (path) => path.replace(/^\/app/, "") || "/",
 
     onProxyReq(proxyReq, req) {
@@ -146,7 +145,7 @@ app.use(
     onProxyRes(proxyRes) {
       rewriteLocationToApp(proxyRes);
 
-      // (Opcional) si cookies quedan con Path=/ y te jode en /app
+      // Si necesitás cookies scoped a /app, descomentá:
       // const sc = proxyRes.headers["set-cookie"];
       // if (Array.isArray(sc)) {
       //   proxyRes.headers["set-cookie"] = sc.map((c) =>
@@ -160,7 +159,8 @@ app.use(
 );
 
 // ------------------------------------------------------
-// /shop/* -> FRONT (STRIP /shop)
+// /shop/* -> FRONT
+// ✅ NO STRIP /shop (porque tu frontend ya está armado para vivir bajo /shop)
 // ------------------------------------------------------
 app.use(
   "/shop",
@@ -171,11 +171,9 @@ app.use(
     ws: true,
     logLevel: LOG_LEVEL,
 
-    // ✅ hacia el upstream sacamos el prefijo /shop
-    pathRewrite: (path) => path.replace(/^\/shop/, "") || "/",
-
+    // 👇 NO pathRewrite acá (evita loop / -> /shop/)
     onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req);
+      setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/shop" });
     },
 
     onError: proxyError("shop"),
@@ -183,29 +181,12 @@ app.use(
 );
 
 // ------------------------------------------------------
-// Fallback: todo lo demás -> /shop/* (para assets o links sin prefijo)
+// Todo lo que no sea /api o /app o /shop => mandalo a /shop/ (redir)
+// (evita que assets sueltos te entren a loops raros)
 // ------------------------------------------------------
-app.use(
-  "/",
-  createProxyMiddleware({
-    target: SHOP_UPSTREAM,
-    changeOrigin: true,
-    xfwd: true,
-    ws: true,
-    logLevel: LOG_LEVEL,
-
-    pathRewrite: (path) => {
-      if (path === "/") return "/";
-      return path; // el upstream ya recibe raíz del frontend
-    },
-
-    onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req);
-    },
-
-    onError: proxyError("root"),
-  })
-);
+app.use((req, res) => {
+  return res.redirect(301, "/shop/");
+});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ pos360-edge on :${PORT}`);
