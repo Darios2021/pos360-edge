@@ -1,12 +1,16 @@
 /**
- * ✅ pos360-edge/server.js — TRACE FINAL
- * Objetivo: saber EXACTAMENTE qué URL ve Express y por qué termina en 301.
+ * ✅ pos360-edge/server.js — FINAL (NO LOOP + MATCH FORTE)
+ * - Captura /shop, /shop/, /shop/* con regex (sin depender de strict routing)
+ * - Agrega headers para debug: X-EDGE-HIT
+ * - /api -> proxy
+ * - /app -> proxy
  */
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
+app.set("trust proxy", true);
 
 function env(name, fallback) {
   const v = process.env[name];
@@ -22,68 +26,52 @@ const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend"
 const APP_UPSTREAM  = env("APP_UPSTREAM", "http://srv-captain--pos360-admin").replace(/\/+$/, "");
 const API_ORIGIN    = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000").replace(/\/+$/, "");
 
-app.set("trust proxy", true);
-
-// ✅ TRACE global (PRIMER middleware)
+// ===== TRACE =====
 app.use((req, res, next) => {
-  const u = req.originalUrl || req.url || "";
-  if (u.startsWith("/shop")) {
-    console.log("🧭 REQ", JSON.stringify({
-      method: req.method,
-      originalUrl: req.originalUrl,
-      url: req.url,
-      baseUrl: req.baseUrl,
-      path: req.path,
-      host: req.headers.host,
-      xfp: req.headers["x-forwarded-proto"],
-      xfh: req.headers["x-forwarded-host"],
-      proto: req.protocol,
-    }));
-  }
-
-  // Hook para ver si alguien llama redirect
-  const _redirect = res.redirect.bind(res);
-  res.redirect = (a, b) => {
-    let status = 302, loc = a;
-    if (typeof a === "number") { status = a; loc = b; }
-    console.log("➡️ res.redirect()", JSON.stringify({ status, from: req.originalUrl, to: loc }));
-    return _redirect(a, b);
-  };
-
+  // esto te deja ver EXACTO qué ruta ve Express
+  console.log("🧭 REQ", req.method, {
+    originalUrl: req.originalUrl,
+    url: req.url,
+    path: req.path,
+    host: req.headers.host,
+    xfp: req.headers["x-forwarded-proto"],
+  });
   next();
 });
 
-// Health
+// ===== HEALTH =====
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_TRACE_RUNTIME_01"));
+  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_FINAL_MATCH_FORTE_01"));
   res.json({
     ok: true,
     service: "pos360-edge",
-    build: env("X_EDGE_BUILD", "EDGE_TRACE_RUNTIME_01"),
+    build: env("X_EDGE_BUILD", "EDGE_FINAL_MATCH_FORTE_01"),
     shopUpstream: SHOP_UPSTREAM,
     appUpstream: APP_UPSTREAM,
     apiOrigin: API_ORIGIN,
   });
 });
 
-// ✅ 1) SHOP proxy primero
-app.use(
-  "/shop/",
-  createProxyMiddleware({
-    target: SHOP_UPSTREAM,
-    changeOrigin: true,
-    logLevel: PROXY_LOG_LEVEL,
-    xfwd: true,
-    onProxyReq(proxyReq, req, res) {
-      res.setHeader("X-EDGE-HIT", "shop-proxy");
-    },
-    onProxyRes(proxyRes) {
-      proxyRes.headers["X-EDGE-PROXY"] = "shop";
-    },
-  })
-);
+// ===== PROXIES =====
 
-// API
+// ✅ SHOP: regex captura /shop, /shop/, /shop/loquesea
+const shopProxy = createProxyMiddleware({
+  target: SHOP_UPSTREAM,
+  changeOrigin: true,
+  logLevel: PROXY_LOG_LEVEL,
+  xfwd: true,
+  onProxyRes(proxyRes) {
+    proxyRes.headers["X-EDGE-HIT"] = "shop-proxy";
+  },
+});
+
+// match fuerte
+app.use(/^\/shop(\/|$)/, (req, res, next) => {
+  res.setHeader("X-EDGE-HIT", "shop-entry");
+  return shopProxy(req, res, next);
+});
+
+// ✅ API
 app.use(
   "/api",
   createProxyMiddleware({
@@ -92,39 +80,36 @@ app.use(
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
     pathRewrite: { "^/api": "" },
-    onProxyReq(proxyReq, req, res) {
-      res.setHeader("X-EDGE-HIT", "api-proxy");
-    },
     onProxyRes(proxyRes) {
-      proxyRes.headers["X-EDGE-PROXY"] = "api";
+      proxyRes.headers["X-EDGE-HIT"] = "api-proxy";
     },
   })
 );
 
-// APP
+// ✅ APP
 app.use(
-  "/app/",
+  /^\/app(\/|$)/,
   createProxyMiddleware({
     target: APP_UPSTREAM,
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
-    onProxyReq(proxyReq, req, res) {
-      res.setHeader("X-EDGE-HIT", "app-proxy");
-    },
     onProxyRes(proxyRes) {
-      proxyRes.headers["X-EDGE-PROXY"] = "app";
+      proxyRes.headers["X-EDGE-HIT"] = "app-proxy";
     },
   })
 );
 
-// Redirects
-app.get("/", (req, res) => res.redirect(301, "/shop/"));
-app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
+// ===== ROOT =====
+app.get("/", (req, res) => {
+  res.setHeader("X-EDGE-HIT", "root-redirect");
+  return res.redirect(301, "/shop/");
+});
 
-// Fallback
+// ===== FALLBACK =====
 app.use((req, res) => {
+  res.setHeader("X-EDGE-HIT", "edge-404");
   res.status(404).type("text/plain").send("edge: not found");
 });
 
-app.listen(PORT, () => console.log(`✅ pos360-edge TRACE en :${PORT}`));
+app.listen(PORT, () => console.log(`✅ pos360-edge FINAL en :${PORT}`));
