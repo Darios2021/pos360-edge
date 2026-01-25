@@ -1,19 +1,17 @@
 /**
- * ✅ pos360-edge/server.js — COPY-PASTE FINAL (CapRover OK + no loops)
+ * ✅ pos360-edge/server.js — COPY-PASTE FINAL (CapRover friendly)
  *
- * FIX:
- * - /health y / devuelven 200 (CapRover no mata el container)
- * - NO manda Host interno al upstream (evita Location srv-captain)
- * - Fuerza X-Forwarded-Proto desde PUBLIC_BASE_URL (evita http->https loops)
- * - /app: strip + Location rewrite + Cookie Path=/app
+ * Claves:
+ * - /            => 200 (HTML)  ✅ (CapRover healthcheck por defecto)
+ * - /health      => 200 (JSON)  ✅
+ * - /shop/*      => frontend
+ * - /app/*       => admin (strip /app) + Location/Cookie rewrite
+ * - /api/v1/*    => API
+ * - /api/*       => alias a /api/v1/*
  *
- * ROUTING:
- * - /           -> 200 HTML que manda a /shop/ (sin 301)
- * - /health     -> 200 JSON
- * - /shop*      -> FRONTEND
- * - /api/v1*    -> API
- * - /api*       -> alias => /api/v1/*
- * - /app*       -> ADMIN (strip /app)
+ * Anti-loops:
+ * - Fuerza X-Forwarded-Proto = https si PUBLIC_BASE_URL está seteada
+ * - NO manda Host interno al upstream (mantiene Host público)
  */
 
 const express = require("express");
@@ -23,7 +21,6 @@ const app = express();
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 
-// ---------------- env helpers ----------------
 function env(name, fallback) {
   const v = process.env[name];
   return v !== undefined && v !== null && String(v).trim() !== ""
@@ -52,7 +49,7 @@ const LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 // PUBLIC (proto/host correctos)
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "");
 const PUBLIC = PUBLIC_BASE_URL ? asUrl("PUBLIC_BASE_URL", PUBLIC_BASE_URL) : null;
-const PUBLIC_PROTO = PUBLIC ? PUBLIC.protocol.replace(":", "") : ""; // "" => fallback
+const PUBLIC_PROTO = PUBLIC ? PUBLIC.protocol.replace(":", "") : "";
 
 // Targets
 const SHOP_UPSTREAM = asUrl(
@@ -90,11 +87,14 @@ function clientHost(req) {
 }
 
 function forwardedProto(req) {
+  // si PUBLIC_BASE_URL está seteada, manda esa
   if (PUBLIC_PROTO) return PUBLIC_PROTO;
+
   const xfp = String(req.headers["x-forwarded-proto"] || "")
     .split(",")[0]
     .trim();
   if (xfp) return xfp;
+
   return req.secure ? "https" : "http";
 }
 
@@ -106,14 +106,11 @@ function setForwardedHeaders(proxyReq, req, extra = {}) {
   proxyReq.setHeader("X-Forwarded-Proto", proto);
   proxyReq.setHeader("X-Forwarded-Port", proto === "https" ? "443" : "80");
   proxyReq.setHeader("X-Real-IP", req.headers["x-real-ip"] || req.ip || "");
-  proxyReq.setHeader(
-    "X-Forwarded-For",
-    req.headers["x-forwarded-for"] || req.ip || ""
-  );
+  proxyReq.setHeader("X-Forwarded-For", req.headers["x-forwarded-for"] || req.ip || "");
 
-  Object.entries(extra).forEach(([k, v]) => proxyReq.setHeader(k, v));
+  for (const [k, v] of Object.entries(extra)) proxyReq.setHeader(k, v);
 
-  // ✅ CRÍTICO: mantené el Host público (evita Location http://srv-captain--)
+  // ✅ mantener Host público (evita Location a srv-captain)
   if (host) proxyReq.setHeader("Host", host);
 }
 
@@ -133,10 +130,11 @@ function normalizeShopLocation(proxyRes) {
   if (loc === "/shop//") proxyRes.headers.location = "/shop/";
 }
 
-// Reescribe Location absoluto si algún upstream insiste con srv-captain
 function rewriteAbsoluteLocationToPublic(proxyRes, req) {
   const loc = proxyRes.headers?.location;
   if (!loc || typeof loc !== "string") return;
+
+  // si ya es relativo, listo
   if (loc.startsWith("/")) return;
 
   const host = clientHost(req);
@@ -156,13 +154,9 @@ function rewriteLocationToApp(proxyRes) {
   const loc = proxyRes.headers?.location;
   if (!loc || typeof loc !== "string") return;
 
-  // Solo relativos
   if (!loc.startsWith("/")) return;
-
-  // ya ok
   if (loc.startsWith("/app/") || loc === "/app") return;
 
-  // prefix /app
   proxyRes.headers.location = "/app" + loc;
 }
 
@@ -177,8 +171,8 @@ function rewriteSetCookiePathToApp(proxyRes) {
   else if (typeof sc === "string") proxyRes.headers["set-cookie"] = fix(sc);
 }
 
-// ---------------- health (200) ----------------
-app.get("/health", (req, res) =>
+// ---------------- health ----------------
+app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
     service: "pos360-edge",
@@ -186,22 +180,22 @@ app.get("/health", (req, res) =>
     app: APP_UPSTREAM.href,
     api: API_V1_TARGET.href,
     publicBase: PUBLIC_BASE_URL || `${forwardedProto(req)}://${clientHost(req)}`,
-  })
-);
+  });
+});
 
-// ---------------- root (200) ----------------
-// Importante: NO 301/302 acá, para que CapRover no te mate el contenedor.
+// ✅ ROOT 200 (para CapRover) + manda al humano a /shop/
 app.get("/", (_req, res) => {
   res.status(200).type("html").send(`<!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <meta http-equiv="refresh" content="0; url=/shop/" />
-  </head>
-  <body>
-    <script>location.replace('/shop/');</script>
-    <noscript><a href="/shop/">/shop/</a></noscript>
-  </body>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="0; url=/shop/" />
+  <title>pos360-edge</title>
+</head>
+<body>
+  <script>location.replace('/shop/');</script>
+  <noscript><a href="/shop/">/shop/</a></noscript>
+</body>
 </html>`);
 });
 
@@ -282,7 +276,7 @@ app.use(
   })
 );
 
-// fallback (mantengo 302 acá, no afecta health)
+// fallback (no afecta healthcheck porque / ya es 200)
 app.use((_req, res) => res.redirect(302, "/shop/"));
 
 app.listen(PORT, "0.0.0.0", () => {
