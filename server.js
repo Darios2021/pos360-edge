@@ -4,14 +4,13 @@
  * Routing:
  * - /            -> redirect to /shop/
  * - /shop/*      -> FRONTEND (shop)
- * - /app/*       -> FRONTEND (backoffice vive en el mismo frontend)
+ * - /app/*       -> FRONTEND (backoffice en el mismo frontend)
  * - /api/*       -> API (/api/v1)
  *
- * Fixes:
- * - trust proxy => detecta https correctamente (Cloudflare/CapRover/Nginx)
- * - fuerza headers X-Forwarded-* coherentes
- * - ✅ SETEA Host del upstream al host público (evita redirects a srv-captain--)
- * - reescribe Location para que JAMÁS salga srv-captain--pos360-frontend
+ * Fix CRÍTICO:
+ * - http-proxy-middleware (versiones nuevas) => usar "on: { proxyReq, proxyRes }"
+ * - ✅ fuerza Host público al upstream (evita redirects a srv-captain--)
+ * - ✅ reescribe Location: http://srv-captain--... -> https://sanjuantecnologia.com/...
  */
 
 const express = require("express");
@@ -54,7 +53,7 @@ function setForwardHeaders(proxyReq, req) {
   const https = isHttps(req);
   const host = (req.headers.host || PUBLIC_HOST || "").toString();
 
-  // ✅ clave: evitá que upstream genere redirects con srv-captain--
+  // ✅ CLAVE: upstream arma redirect con Host, así que lo pisamos
   proxyReq.setHeader("Host", host);
 
   proxyReq.setHeader("X-Forwarded-Proto", https ? "https" : "http");
@@ -65,7 +64,7 @@ function setForwardHeaders(proxyReq, req) {
 }
 
 function rewriteLocation(proxyRes, req) {
-  const loc = proxyRes.headers && (proxyRes.headers["location"] || proxyRes.headers["Location"]);
+  const loc = proxyRes.headers?.location;
   if (!loc) return;
 
   const host = (req.headers.host || PUBLIC_HOST || "").toString();
@@ -73,19 +72,35 @@ function rewriteLocation(proxyRes, req) {
 
   let newLoc = String(loc);
 
-  // ✅ si upstream devuelve host interno -> host público
+  // ✅ host interno -> host público
   newLoc = newLoc.replace(/^http:\/\/srv-captain--pos360-frontend(?=\/|$)/i, `https://${host}`);
   newLoc = newLoc.replace(/^https:\/\/srv-captain--pos360-frontend(?=\/|$)/i, `https://${host}`);
 
-  // ✅ upgrade http://host -> https://host cuando el request original fue https
+  // ✅ si request original era https, upgrade cualquier http
   if (isHttps(req)) {
-    newLoc = newLoc.replace(new RegExp(`^http:\\/\\/${host.replace(/\./g, "\\.")}(?=\\/|$)`, "i"), `https://${host}`);
     newLoc = newLoc.replace(/^http:\/\//i, "https://");
   }
 
-  if (newLoc !== loc) {
-    proxyRes.headers["location"] = newLoc; // node normaliza a lowercase
-  }
+  if (newLoc !== loc) proxyRes.headers.location = newLoc;
+}
+
+function makeProxy(target, { stripPrefix } = {}) {
+  return createProxyMiddleware({
+    target,
+    changeOrigin: true,
+    logLevel: PROXY_LOG_LEVEL,
+    xfwd: true,
+
+    // ✅ API NUEVA (http-proxy-middleware)
+    on: {
+      proxyReq: (proxyReq, req) => setForwardHeaders(proxyReq, req),
+      proxyRes: (proxyRes, req) => rewriteLocation(proxyRes, req),
+    },
+
+    pathRewrite: stripPrefix
+      ? (path) => path.replace(stripPrefix, "")
+      : undefined,
+  });
 }
 
 // ===== Health =====
@@ -118,45 +133,14 @@ app.get("/", (req, res) => {
 </html>`);
 });
 
-// ===== /api -> API =====
-app.use(
-  "/api",
-  createProxyMiddleware({
-    target: API_UPSTREAM,
-    changeOrigin: true,
-    logLevel: PROXY_LOG_LEVEL,
-    xfwd: true,
-    onProxyReq: setForwardHeaders,
-    onProxyRes: rewriteLocation,
-    pathRewrite: (path) => path.replace(/^\/api/, ""),
-  })
-);
+// ===== /api -> API (/api/v1) =====
+app.use("/api", makeProxy(API_UPSTREAM, { stripPrefix: /^\/api/ }));
 
 // ===== /shop -> FRONTEND =====
-app.use(
-  "/shop",
-  createProxyMiddleware({
-    target: SHOP_UPSTREAM,
-    changeOrigin: true,
-    logLevel: PROXY_LOG_LEVEL,
-    xfwd: true,
-    onProxyReq: setForwardHeaders,
-    onProxyRes: rewriteLocation,
-  })
-);
+app.use("/shop", makeProxy(SHOP_UPSTREAM));
 
-// ===== /app -> FRONTEND (backoffice en el mismo frontend) =====
-app.use(
-  "/app",
-  createProxyMiddleware({
-    target: APP_UPSTREAM,
-    changeOrigin: true,
-    logLevel: PROXY_LOG_LEVEL,
-    xfwd: true,
-    onProxyReq: setForwardHeaders,
-    onProxyRes: rewriteLocation,
-  })
-);
+// ===== /app -> FRONTEND =====
+app.use("/app", makeProxy(APP_UPSTREAM));
 
 app.listen(PORT, () => {
   console.log(`✅ pos360-edge on :${PORT}`);
