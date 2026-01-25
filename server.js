@@ -1,17 +1,16 @@
 /**
- * ✅ pos360-edge/server.js — COPY-PASTE FINAL DEFINITIVO
+ * ✅ pos360-edge/server.js — COPY-PASTE FINAL (FIX 502 by healthcheck)
  *
- * FIX CRÍTICO:
- * - "/" responde 200 OK para CapRover (healthcheck implícito)
- * - Navegadores siguen redirigidos a /shop/
- * - Evita SIGTERM + 502 Bad Gateway
+ * FIX CLAVE:
+ * - CapRover healthcheck suele pegarle a "/" y espera 200 (NO 301).
+ * - "/" ahora devuelve 200 con HTML que redirige a /shop/ (browser OK, healthcheck OK).
  *
  * Reverse proxy por PATH:
- * - /        -> 200 OK (health) | navegador -> /shop/
+ * - /        -> 200 (HTML redirect a /shop/)
  * - /shop*   -> TIENDA
  * - /api/v1* -> API
  * - /api*    -> alias => /api/v1/*
- * - /app*    -> ADMIN (strip /app)
+ * - /app*    -> ADMIN (strip /app) + Location rewrite + Cookie Path=/app
  */
 
 const express = require("express");
@@ -21,7 +20,6 @@ const app = express();
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 
-// ---------------- utils ----------------
 function env(name, fallback) {
   const v = process.env[name];
   return v !== undefined && v !== null && String(v).trim() !== ""
@@ -31,7 +29,7 @@ function env(name, fallback) {
 
 function normalizeHttpUrl(name, value, fallback) {
   const v = env(name, value ?? fallback ?? "");
-  if (!v) throw new Error(`Missing env ${name}`);
+  if (!v) throw new Error(`Missing required env: ${name}`);
   if (/^https?:\/\//i.test(v)) return v;
   return `http://${v}`;
 }
@@ -44,27 +42,38 @@ function asUrl(name, raw) {
   }
 }
 
-// ---------------- config ----------------
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 const LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
+// PUBLIC (para proto/host correctos)
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "");
 const PUBLIC = PUBLIC_BASE_URL ? asUrl("PUBLIC_BASE_URL", PUBLIC_BASE_URL) : null;
 const PUBLIC_PROTO = PUBLIC ? PUBLIC.protocol.replace(":", "") : "https";
 
+// Targets
 const SHOP_UPSTREAM = asUrl(
   "SHOP_UPSTREAM",
-  normalizeHttpUrl("SHOP_UPSTREAM", env("SHOP_UPSTREAM"), "http://srv-captain--pos360-frontend")
+  normalizeHttpUrl(
+    "SHOP_UPSTREAM",
+    env("SHOP_UPSTREAM"),
+    "http://srv-captain--pos360-frontend"
+  )
 );
-
 const APP_UPSTREAM = asUrl(
   "APP_UPSTREAM",
-  normalizeHttpUrl("APP_UPSTREAM", env("APP_UPSTREAM"), "http://srv-captain--pos360-admin")
+  normalizeHttpUrl(
+    "APP_UPSTREAM",
+    env("APP_UPSTREAM"),
+    "http://srv-captain--pos360-admin"
+  )
 );
-
 const API_ORIGIN = asUrl(
   "API_ORIGIN",
-  normalizeHttpUrl("API_ORIGIN", env("API_ORIGIN"), "http://srv-captain--pos360-commerce-api:3000")
+  normalizeHttpUrl(
+    "API_ORIGIN",
+    env("API_ORIGIN"),
+    "http://srv-captain--pos360-commerce-api:3000"
+  )
 );
 
 const API_V1_TARGET = new URL("/api/v1", API_ORIGIN);
@@ -74,6 +83,7 @@ function clientHost(req) {
   return String(req.headers.host || "");
 }
 
+// Fuerza proto público (evita http redirects)
 function forwardedProto(req) {
   if (PUBLIC_PROTO) return PUBLIC_PROTO;
   const xfp = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
@@ -85,22 +95,32 @@ function setForwardedHeaders(proxyReq, req, extra = {}) {
   const host = clientHost(req);
   const proto = forwardedProto(req);
 
-  proxyReq.setHeader("Host", host);
   proxyReq.setHeader("X-Forwarded-Host", host);
   proxyReq.setHeader("X-Forwarded-Proto", proto);
   proxyReq.setHeader("X-Forwarded-Port", proto === "https" ? "443" : "80");
-  proxyReq.setHeader("X-Real-IP", req.ip || "");
+  proxyReq.setHeader("X-Real-IP", req.headers["x-real-ip"] || req.ip || "");
   proxyReq.setHeader("X-Forwarded-For", req.headers["x-forwarded-for"] || req.ip || "");
 
   Object.entries(extra).forEach(([k, v]) => proxyReq.setHeader(k, v));
+
+  // ✅ CRÍTICO: mantené el Host PUBLICO, NO el interno
+  if (host) proxyReq.setHeader("Host", host);
 }
 
 function proxyError(where) {
   return (err, req, res) => {
-    console.error(`[${where}]`, err?.message || err);
+    console.error(`[${where}] proxy error:`, err?.message || err);
+    console.error(`[${where}] request:`, req?.method, req?.originalUrl);
     if (!res.headersSent) res.status(502);
     res.end(`Bad gateway (${where})`);
   };
+}
+
+function normalizeShopLocation(proxyRes) {
+  const loc = proxyRes.headers?.location;
+  if (!loc || typeof loc !== "string") return;
+  if (loc === "/shop") proxyRes.headers.location = "/shop/";
+  if (loc === "/shop//") proxyRes.headers.location = "/shop/";
 }
 
 function rewriteAbsoluteLocationToPublic(proxyRes, req) {
@@ -108,16 +128,39 @@ function rewriteAbsoluteLocationToPublic(proxyRes, req) {
   if (!loc || typeof loc !== "string") return;
   if (loc.startsWith("/")) return;
 
+  const host = clientHost(req);
+  const proto = forwardedProto(req);
+
   try {
     const u = new URL(loc);
     if (/^srv-captain--/i.test(u.hostname)) {
-      proxyRes.headers.location =
-        `${forwardedProto(req)}://${clientHost(req)}${u.pathname}${u.search}${u.hash}`;
+      proxyRes.headers.location = `${proto}://${host}${u.pathname}${u.search}${u.hash}`;
     }
-  } catch {}
+  } catch {
+    // ignore
+  }
 }
 
-// ---------------- HEALTH ----------------
+function rewriteLocationToApp(proxyRes) {
+  const loc = proxyRes.headers?.location;
+  if (!loc || typeof loc !== "string") return;
+  if (!loc.startsWith("/")) return;
+  if (loc.startsWith("/app/") || loc === "/app") return;
+  proxyRes.headers.location = "/app" + loc;
+}
+
+function rewriteSetCookiePathToApp(proxyRes) {
+  const sc = proxyRes.headers["set-cookie"];
+  if (!sc) return;
+
+  const fix = (cookie) =>
+    cookie.replace(/;\s*Path=\/(\s*;|$)/i, "; Path=/app$1");
+
+  if (Array.isArray(sc)) proxyRes.headers["set-cookie"] = sc.map(fix);
+  else if (typeof sc === "string") proxyRes.headers["set-cookie"] = fix(sc);
+}
+
+// ---------------- health ----------------
 app.get("/health", (req, res) =>
   res.status(200).json({
     ok: true,
@@ -129,20 +172,26 @@ app.get("/health", (req, res) =>
   })
 );
 
-// ---------------- ROOT (FIX CRÍTICO) ----------------
-app.get("/", (req, res) => {
-  const accept = String(req.headers.accept || "");
-
-  // Navegador
-  if (accept.includes("text/html")) {
-    return res.redirect(302, "/shop/");
-  }
-
-  // Healthcheck / curl / nginx
-  return res.status(200).send("ok");
+// ✅ ROOT: 200 (CapRover) + redirect visual a /shop/
+app.get("/", (_req, res) => {
+  res
+    .status(200)
+    .type("html")
+    .send(`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="refresh" content="0; url=/shop/" />
+    <title>POS360</title>
+  </head>
+  <body>
+    <script>location.replace('/shop/');</script>
+    <noscript><a href="/shop/">Ir a /shop/</a></noscript>
+  </body>
+</html>`);
 });
 
-// ---------------- API ----------------
+// ---------------- /api/v1 passthrough ----------------
 app.use(
   "/api/v1",
   createProxyMiddleware({
@@ -160,6 +209,7 @@ app.use(
   })
 );
 
+// ---------------- /api alias -> /api/v1 ----------------
 app.use(
   "/api",
   createProxyMiddleware({
@@ -178,7 +228,7 @@ app.use(
   })
 );
 
-// ---------------- ADMIN ----------------
+// ---------------- /app -> admin ----------------
 app.use(
   "/app",
   createProxyMiddleware({
@@ -191,13 +241,15 @@ app.use(
       setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/app" });
     },
     onProxyRes(proxyRes, req) {
+      rewriteLocationToApp(proxyRes);
+      rewriteSetCookiePathToApp(proxyRes);
       rewriteAbsoluteLocationToPublic(proxyRes, req);
     },
     onError: proxyError("app"),
   })
 );
 
-// ---------------- SHOP ----------------
+// ---------------- /shop -> frontend ----------------
 app.use(
   "/shop",
   createProxyMiddleware({
@@ -209,16 +261,16 @@ app.use(
       setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/shop" });
     },
     onProxyRes(proxyRes, req) {
+      normalizeShopLocation(proxyRes);
       rewriteAbsoluteLocationToPublic(proxyRes, req);
     },
     onError: proxyError("shop"),
   })
 );
 
-// ---------------- FALLBACK ----------------
+// fallback
 app.use((_req, res) => res.redirect(302, "/shop/"));
 
-// ---------------- LISTEN ----------------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ pos360-edge on :${PORT}`);
   console.log(`shop -> ${SHOP_UPSTREAM.href}`);
