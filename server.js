@@ -1,20 +1,21 @@
 /**
- * ✅ pos360-edge/server.js — FINAL DEFINITIVO (SHOP STRIP PREFIX)
- * - /shop/*  -> proxy al frontend, quitando prefijo /shop
- * - /shop    -> 301 a /shop/
- * - /        -> 301 a /shop/
- * - /api/*   -> proxy a API (quitando /api)
- * - /app/*   -> proxy a admin (quitando /app)
+ * ✅ pos360-edge/server.js — FIX DEFINITIVO 301 LOOP
+ * CAUSA: Express (strict routing OFF) hacía que "/shop" matchee también "/shop/"
  *
- * IMPORTANTÍSIMO:
- * - Esto fuerza a que el frontend reciba paths como "/", "/product/303", etc.
- * - Evita loops 301 porque no devuelve /shop/ nunca desde edge.
+ * Solución:
+ * - app.enable("strict routing")  => "/shop" != "/shop/"
+ * - Proxy vive en "/shop/" (con slash)
+ * - Redirect SOLO para "/shop" (sin slash)
+ * - "/" redirige a "/shop/"
  */
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
+
+// ✅ CLAVE: hace que /shop y /shop/ sean distintos
+app.enable("strict routing");
 app.set("trust proxy", true);
 
 function env(name, fallback) {
@@ -31,54 +32,39 @@ const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend"
 const APP_UPSTREAM  = env("APP_UPSTREAM", "http://srv-captain--pos360-admin").replace(/\/+$/, "");
 const API_ORIGIN    = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000").replace(/\/+$/, "");
 
-// TRACE
-app.use((req, res, next) => {
-  console.log("🧭 REQ", req.method, req.originalUrl, {
-    host: req.headers.host,
-    xfp: req.headers["x-forwarded-proto"],
-  });
-  next();
-});
-
-// Health
+// ---- Health
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_FINAL_STRIP_SHOP_01"));
+  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_STRICT_ROUTING_FIX_01"));
   res.json({
     ok: true,
     service: "pos360-edge",
-    build: env("X_EDGE_BUILD", "EDGE_FINAL_STRIP_SHOP_01"),
+    build: env("X_EDGE_BUILD", "EDGE_STRICT_ROUTING_FIX_01"),
     shopUpstream: SHOP_UPSTREAM,
     appUpstream: APP_UPSTREAM,
     apiOrigin: API_ORIGIN,
   });
 });
 
-// Redirects mínimos
-app.get("/", (req, res) => res.redirect(301, "/shop/"));
-app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
-
-// ✅ SHOP proxy: montar en /shop y STRIP del prefijo
+// ✅ SHOP PROXY (con slash)
 app.use(
-  "/shop",
+  "/shop/",
   createProxyMiddleware({
     target: SHOP_UPSTREAM,
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
-    // /shop/product/303 => /product/303
-    pathRewrite: (path) => path.replace(/^\/shop/, "") || "/",
+    // IMPORTANTE: NO tocar path. El frontend YA sirve /shop/
     onProxyRes(proxyRes) {
       proxyRes.headers["X-EDGE-HIT"] = "shop-proxy";
     },
     onError(err, req, res) {
       console.error("❌ SHOP proxy error", err?.message || err);
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end("edge: shop proxy error");
+      res.status(502).type("text/plain").send("edge: shop proxy error");
     },
   })
 );
 
-// ✅ API proxy: strip /api
+// ✅ API
 app.use(
   "/api",
   createProxyMiddleware({
@@ -86,27 +72,30 @@ app.use(
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
-    pathRewrite: (path) => path.replace(/^\/api/, "") || "/",
+    pathRewrite: { "^/api": "" },
     onProxyRes(proxyRes) {
       proxyRes.headers["X-EDGE-HIT"] = "api-proxy";
     },
   })
 );
 
-// ✅ APP proxy: strip /app
+// ✅ APP (si tu admin vive en otro upstream)
 app.use(
-  "/app",
+  "/app/",
   createProxyMiddleware({
     target: APP_UPSTREAM,
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
-    pathRewrite: (path) => path.replace(/^\/app/, "") || "/",
     onProxyRes(proxyRes) {
       proxyRes.headers["X-EDGE-HIT"] = "app-proxy";
     },
   })
 );
+
+// ✅ Redirects (ahora NO matchea /shop/)
+app.get("/", (req, res) => res.redirect(301, "/shop/"));
+app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 
 // Fallback
 app.use((req, res) => {
@@ -114,4 +103,4 @@ app.use((req, res) => {
   res.status(404).type("text/plain").send("edge: not found");
 });
 
-app.listen(PORT, () => console.log(`✅ pos360-edge FINAL STRIP en :${PORT}`));
+app.listen(PORT, () => console.log(`✅ pos360-edge FIX strict routing en :${PORT}`));
