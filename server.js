@@ -4,9 +4,9 @@
  * Routing:
  * - /            -> 301 /shop/
  * - /shop        -> 301 /shop/
- * - /shop/*      -> FRONTEND (NO redirects)
+ * - /shop/*      -> FRONTEND
  * - /app/*       -> FRONTEND
- * - /api/*       -> API (API_ORIGIN)  (API_ORIGIN SIN /api, SIN /v1)
+ * - /api/*       -> API (API_ORIGIN)
  */
 
 const express = require("express");
@@ -14,6 +14,9 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
 app.set("trust proxy", true);
+
+// ✅ CRÍTICO: hace que "/shop" NO matchee "/shop/"
+app.enable("strict routing");
 
 function env(name, fallback) {
   const v = process.env[name];
@@ -61,10 +64,6 @@ function forceForwardHeaders(proxyReq, req) {
   if (host) proxyReq.setHeader("X-Forwarded-Host", host);
 }
 
-/**
- * Reescribe Location ABSOLUTO del upstream (srv-captain--pos360-frontend, etc)
- * a tu dominio público. Si Location es relativo (/shop/), NO se toca.
- */
 function rewriteLocation(proxyRes, req) {
   const loc = proxyRes.headers?.location;
   if (!loc) return;
@@ -94,7 +93,6 @@ function rewriteLocation(proxyRes, req) {
     `https://${host}`
   );
 
-  // Si el request llega por HTTPS, evitá que Location quede en http://tu-host
   if (isHttps(req)) {
     const hostEsc = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     newLoc = newLoc.replace(
@@ -106,9 +104,6 @@ function rewriteLocation(proxyRes, req) {
   if (newLoc !== loc) proxyRes.headers.location = newLoc;
 }
 
-// ======================
-// Health
-// ======================
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -125,16 +120,10 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ======================
-// ✅ Redirects EXACTOS (evita loop /shop/ -> /shop/)
-// ======================
+// ✅ Redirects EXACTOS (ahora sí: /shop no agarra /shop/)
 app.get("/", (req, res) => res.redirect(301, "/shop/"));
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 
-// ======================
-// API proxy
-// /api/* -> API_ORIGIN/*
-// ======================
 app.use(
   "/api",
   createProxyMiddleware({
@@ -148,11 +137,6 @@ app.use(
   })
 );
 
-// ======================
-// SHOP proxy
-// /shop/* -> SHOP_UPSTREAM/shop/*
-// (NO redirects acá)
-// ======================
 app.use(
   "/shop",
   createProxyMiddleware({
@@ -165,10 +149,6 @@ app.use(
   })
 );
 
-// ======================
-// APP proxy
-// /app/* -> APP_UPSTREAM/app/*
-// ======================
 app.use(
   "/app",
   createProxyMiddleware({
