@@ -1,15 +1,14 @@
 /**
- * ✅ pos360-edge/server.js — VERSIÓN FINAL CORREGIDA
- * * Cambios realizados:
- * 1. Eliminación del middleware global que comparaba req.url === "/shop".
- * 2. Mantenimiento de la redirección de raíz "/" únicamente.
- * 3. Priorización de proxies para evitar intercepciones de Express.
+ * ✅ pos360-edge/server.js — VERSIÓN FINAL (STRICT ROUTING)
  */
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
+
+// Deshabilitar la normalización automática de slashes de Express
+app.set("strict routing", true); 
 app.set("trust proxy", true);
 
 function env(name, fallback) {
@@ -71,21 +70,25 @@ function rewriteLocation(proxyRes, req) {
 // ---- 1. Health Check
 app.get("/health", (req, res) => {
   res.json({
-    ok: true,
+    ok: "STRICT_MODE_ACTIVE",
     service: "pos360-edge",
     shop: `${SHOP_UPSTREAM}/`,
-    apiOrigin: API_ORIGIN,
-    publicBase: PUBLIC_BASE_URL
+    apiOrigin: API_ORIGIN
   });
 });
 
 // ---- 2. Redirección de Raíz (ESTRICTA)
-// Solo redirige si entran a https://dominio.com/
 app.get("/", (req, res) => {
   return res.redirect(301, "/shop/");
 });
 
-// ---- 3. Proxy API
+// ---- 3. Redirección manual para /shop (sin slash)
+// Esto evita que el proxy se confunda
+app.get("/shop", (req, res) => {
+  return res.redirect(301, "/shop/");
+});
+
+// ---- 4. Proxy API
 app.use(
   "/api",
   createProxyMiddleware({
@@ -99,10 +102,9 @@ app.use(
   })
 );
 
-// ---- 4. Proxy FRONTEND (Maneja /shop y /shop/)
-// Al no haber middlewares previos, el proxy entrega la petición limpia al Nginx del frontend
+// ---- 5. Proxy FRONTEND (Punto de montaje con slash)
 app.use(
-  "/shop",
+  "/shop/",
   createProxyMiddleware({
     target: SHOP_UPSTREAM,
     changeOrigin: true,
@@ -113,9 +115,8 @@ app.use(
   })
 );
 
-// ---- 5. Proxy APP
 app.use(
-  "/app",
+  "/app/",
   createProxyMiddleware({
     target: APP_UPSTREAM,
     changeOrigin: true,
@@ -127,5 +128,5 @@ app.use(
 );
 
 app.listen(PORT, () => {
-  console.log(`✅ pos360-edge funcionando en puerto ${PORT}`);
+  console.log(`✅ pos360-edge STRICT MODE en puerto ${PORT}`);
 });
