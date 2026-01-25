@@ -2,15 +2,16 @@
  * ✅ pos360-edge/server.js (COPY-PASTE FINAL DEFINITIVO)
  *
  * Routing:
- * - /            -> 301 -> /shop/
- * - /shop/*      -> FRONTEND
- * - /app/*       -> FRONTEND
- * - /api/*       -> API (PASSTHROUGH)
+ * - /            -> /shop/
+ * - /shop/*      -> FRONTEND (shop)
+ * - /app/*       -> FRONTEND (backoffice en el mismo frontend)
+ * - /api/*       -> API (API_ORIGIN + path)
  *
  * Fixes:
- * - trust proxy
- * - X-Forwarded-Proto correcto
- * - Location rewrite (si algún upstream manda host interno)
+ * - trust proxy (detecta https)
+ * - fuerza X-Forwarded-Proto
+ * - reescribe Location del upstream (srv-captain--pos360-frontend -> host público)
+ * - ✅ evita que /shop/ termine pegando al "/" del frontend (causa del 301 con host interno)
  */
 
 const express = require("express");
@@ -33,17 +34,13 @@ const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com").
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
 const APP_UPSTREAM = env("APP_UPSTREAM", SHOP_UPSTREAM).replace(/\/+$/, "");
 
-// ✅ ORIGEN API (HOST+PUERTO, SIN /api/v1)
+// ✅ API_ORIGIN = http://srv-captain--pos360-commerce-api:3000
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000").replace(/\/+$/, "");
 
 const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
-function firstHeaderValue(v) {
-  return (v || "").toString().split(",")[0].trim();
-}
-
 function isHttps(req) {
-  const xfProto = firstHeaderValue(req.headers["x-forwarded-proto"]);
+  const xfProto = (req.headers["x-forwarded-proto"] || "").toString().split(",")[0].trim();
   if (xfProto) return xfProto === "https";
   return req.protocol === "https";
 }
@@ -62,17 +59,14 @@ function rewriteLocationToPublic(proxyRes, req) {
 
   let newLoc = loc;
 
-  // si viene host interno => host público
+  // servicios internos -> host público
   newLoc = newLoc.replace(/^http:\/\/srv-captain--pos360-frontend(?=\/|$)/i, `https://${host}`);
   newLoc = newLoc.replace(/^http:\/\/127\.0\.0\.1(?=\/|$)/i, `https://${host}`);
 
   // upgrade http://host -> https://host
-  newLoc = newLoc.replace(
-    new RegExp(`^http:\\/\\/${host.replace(/\./g, "\\.")}(?=\\/|$)`, "i"),
-    `https://${host}`
-  );
+  newLoc = newLoc.replace(new RegExp(`^http:\\/\\/${host.replace(/\./g, "\\.")}(?=\\/|$)`, "i"), `https://${host}`);
 
-  // si el request original fue https, subimos todo a https
+  // si el request original fue https, forzá https sí o sí
   if (isHttps(req)) newLoc = newLoc.replace(/^http:\/\//i, "https://");
 
   if (newLoc !== loc) proxyRes.headers["location"] = newLoc;
@@ -92,10 +86,12 @@ app.get("/health", (req, res) => {
 });
 
 // ===== Root -> /shop/ =====
-app.get("/", (req, res) => res.redirect(301, "/shop/"));
+app.get("/", (req, res) => {
+  res.redirect(301, "/shop/");
+});
 
-// ===== /api -> API (PASSTHROUGH) =====
-// /api/health => API_ORIGIN + /api/health ✅
+// ===== /api -> API =====
+// /api/* -> API_ORIGIN/*  (SIN /api)
 app.use(
   "/api",
   createProxyMiddleware({
@@ -105,11 +101,11 @@ app.use(
     xfwd: true,
     onProxyReq: forceForwardProto,
     onProxyRes: rewriteLocationToPublic,
-    // NO reescribimos: dejamos /api tal cual
+    pathRewrite: (path) => path.replace(/^\/api/, ""),
   })
 );
 
-// ===== /shop -> FRONTEND =====
+// ✅ FIX: /shop -> FRONTEND PERO SIEMPRE BAJO /shop (nunca al / raíz)
 app.use(
   "/shop",
   createProxyMiddleware({
@@ -119,11 +115,16 @@ app.use(
     xfwd: true,
     onProxyReq: forceForwardProto,
     onProxyRes: rewriteLocationToPublic,
-    // NO reescribimos: el frontend ya vive bajo /shop
+    pathRewrite: (path) => {
+      // /shop        -> /shop/
+      if (path === "/shop") return "/shop/";
+      // /shop/xxxxx  -> /shop/xxxxx
+      return path;
+    },
   })
 );
 
-// ===== /app -> FRONTEND =====
+// ===== /app -> FRONTEND (mismo contenedor) =====
 app.use(
   "/app",
   createProxyMiddleware({
@@ -133,13 +134,15 @@ app.use(
     xfwd: true,
     onProxyReq: forceForwardProto,
     onProxyRes: rewriteLocationToPublic,
+    // si tu backoffice vive en /app dentro del mismo frontend: OK.
+    // si vive en /admin: pathRewrite: (p) => p.replace(/^\/app/, "/admin"),
   })
 );
 
 app.listen(PORT, () => {
   console.log(`✅ pos360-edge on :${PORT}`);
-  console.log(`shop -> ${SHOP_UPSTREAM}/shop/`);
-  console.log(`app  -> ${APP_UPSTREAM}/app/`);
-  console.log(`api  -> ${API_ORIGIN}/api/* (passthrough)`);
+  console.log(`shop -> ${SHOP_UPSTREAM}/`);
+  console.log(`app  -> ${APP_UPSTREAM}/`);
+  console.log(`api  -> ${API_ORIGIN}`);
   console.log(`public -> ${PUBLIC_BASE_URL}`);
 });
