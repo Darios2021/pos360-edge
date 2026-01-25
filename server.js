@@ -1,20 +1,20 @@
 /**
- * ✅ pos360-edge/server.js — FIX DEFINITIVO (ANTI 301 LOOP)
- *
- * Causa real del loop:
- * - Algún Nginx/Proxy delante “normaliza” /shop/ -> /shop (quita slash)
- * - Si vos redirigís /shop -> /shop/ => loop infinito
- *
- * Solución:
- * - NO redirigir /shop
- * - PROXY en /shop (sin slash) para agarrar /shop y /shop/
- * - Reconstruir path hacia upstream como /shop + path
+ * ✅ pos360-edge/server.js — FINAL ESTABLE
+ * - /shop/  -> PROXY al frontend (shop)
+ * - /api/*  -> PROXY a API
+ * - /app/*  -> PROXY a Admin
+ * - "/" y "/shop" -> redirect a "/shop/"
+ * - FIX: strict routing para que "/shop" != "/shop/"
+ * - FIX: archivos especiales: /shop/favicon.ico, /robots.txt, /sitemap.xml
  */
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
+
+// ✅ CLAVE: hace que /shop y /shop/ sean distintos
+app.enable("strict routing");
 app.set("trust proxy", true);
 
 function env(name, fallback) {
@@ -33,14 +33,24 @@ const API_ORIGIN    = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api
 
 const BUILD = env("X_EDGE_BUILD", "EDGE_SHOP_PROXY_NO_REDIRECT_01");
 
-// trace simple (para que veas en curl qué pegó)
-app.use((req, res, next) => {
-  res.setHeader("X-EDGE-BUILD", BUILD);
-  next();
-});
+// ====== TRACE (opcional) ======
+const TRACE = String(env("EDGE_TRACE", "0")).trim() === "1";
+if (TRACE) {
+  app.use((req, res, next) => {
+    console.log("🧭 REQ", JSON.stringify({
+      method: req.method,
+      originalUrl: req.originalUrl,
+      host: req.headers.host,
+      xfp: req.headers["x-forwarded-proto"],
+      proto: req.protocol,
+    }));
+    next();
+  });
+}
 
 // ---- Health
 app.get("/health", (req, res) => {
+  res.setHeader("X-EDGE-BUILD", BUILD);
   res.json({
     ok: true,
     service: "pos360-edge",
@@ -51,49 +61,51 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ✅ Root -> /shop/ (está perfecto)
-app.get("/", (req, res) => res.redirect(301, "/shop/"));
+// =====================================================
+// ✅ Archivos especiales (para browsers/bots)
+// =====================================================
 
-/**
- * ✅ SHOP PROXY en "/shop" (sin slash)
- * Express cuando montás "/shop":
- * - request /shop        => req.url = "" o "/"
- * - request /shop/       => req.url = "/"
- * - request /shop/x/y    => req.url = "/x/y"
- *
- * Y nosotros lo mandamos al upstream como:
- *   /shop + req.url
- */
+// Browser a veces pide /shop/favicon.ico aunque el asset real esté en /favicon.ico
+app.get("/shop/favicon.ico", (req, res, next) => {
+  req.url = "/favicon.ico";
+  next();
+});
+
+// robots/sitemap normalmente viven en root del dominio público
+app.get("/robots.txt", (req, res, next) => {
+  req.url = "/robots.txt";
+  next();
+});
+app.get("/sitemap.xml", (req, res, next) => {
+  req.url = "/sitemap.xml";
+  next();
+});
+
+// =====================================================
+// ✅ SHOP PROXY (con slash)
+// =====================================================
 app.use(
-  "/shop",
+  "/shop/",
   createProxyMiddleware({
     target: SHOP_UPSTREAM,
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
-
-    // 🔧 reconstruye la ruta para que el frontend reciba /shop/...
-    pathRewrite: (path, req) => {
-      // path acá es lo que queda DESPUÉS del mount "/shop"
-      // normalmente: "/" o "/product/303"
-      if (!path || path === "") return "/shop/";
-      if (path === "/") return "/shop/";
-      return "/shop" + path; // => /shop/product/303
-    },
-
     onProxyRes(proxyRes) {
+      proxyRes.headers["X-EDGE-BUILD"] = BUILD;
       proxyRes.headers["X-EDGE-HIT"] = "shop-proxy";
     },
-
     onError(err, req, res) {
-      console.error("❌ SHOP proxy error:", err?.message || err);
-      res.setHeader("X-EDGE-HIT", "shop-proxy-error");
+      console.error("❌ SHOP proxy error", err?.message || err);
+      res.setHeader("X-EDGE-BUILD", BUILD);
       res.status(502).type("text/plain").send("edge: shop proxy error");
     },
   })
 );
 
-// ✅ API
+// =====================================================
+// ✅ API PROXY
+// =====================================================
 app.use(
   "/api",
   createProxyMiddleware({
@@ -103,29 +115,38 @@ app.use(
     xfwd: true,
     pathRewrite: { "^/api": "" },
     onProxyRes(proxyRes) {
+      proxyRes.headers["X-EDGE-BUILD"] = BUILD;
       proxyRes.headers["X-EDGE-HIT"] = "api-proxy";
     },
   })
 );
 
-// ✅ APP
+// =====================================================
+// ✅ APP PROXY
+// =====================================================
 app.use(
-  "/app",
+  "/app/",
   createProxyMiddleware({
     target: APP_UPSTREAM,
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
     onProxyRes(proxyRes) {
+      proxyRes.headers["X-EDGE-BUILD"] = BUILD;
       proxyRes.headers["X-EDGE-HIT"] = "app-proxy";
     },
   })
 );
 
+// ✅ Redirects (NO matchea /shop/ gracias a strict routing)
+app.get("/", (req, res) => res.redirect(301, "/shop/"));
+app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
+
 // Fallback
 app.use((req, res) => {
+  res.setHeader("X-EDGE-BUILD", BUILD);
   res.setHeader("X-EDGE-HIT", "edge-404");
   res.status(404).type("text/plain").send("edge: not found");
 });
 
-app.listen(PORT, () => console.log(`✅ pos360-edge RUN ${BUILD} en :${PORT}`));
+app.listen(PORT, () => console.log(`✅ pos360-edge listo en :${PORT}`));
