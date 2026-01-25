@@ -1,4 +1,6 @@
 {
   "schemaVersion": 2,
-  "dockerfilePath": "./Dockerfile"
+  "dockerfilePath": "./Dockerfile",
+  "containerHttpPort": 3000,
+  "healthCheckPath": "/health"
 }

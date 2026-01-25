@@ -1,18 +1,3 @@
-/**
- * ✅ pos360-edge/server.js — COPY-PASTE FINAL (FIX 502 by healthcheck)
- *
- * FIX CLAVE:
- * - CapRover healthcheck suele pegarle a "/" y espera 200 (NO 301).
- * - "/" ahora devuelve 200 con HTML que redirige a /shop/ (browser OK, healthcheck OK).
- *
- * Reverse proxy por PATH:
- * - /        -> 200 (HTML redirect a /shop/)
- * - /shop*   -> TIENDA
- * - /api/v1* -> API
- * - /api*    -> alias => /api/v1/*
- * - /app*    -> ADMIN (strip /app) + Location rewrite + Cookie Path=/app
- */
-
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
@@ -35,55 +20,36 @@ function normalizeHttpUrl(name, value, fallback) {
 }
 
 function asUrl(name, raw) {
-  try {
-    return new URL(raw);
-  } catch {
-    throw new Error(`${name} is not a valid URL: "${raw}"`);
-  }
+  try { return new URL(raw); }
+  catch { throw new Error(`${name} is not a valid URL: "${raw}"`); }
 }
 
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 const LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
-// PUBLIC (para proto/host correctos)
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "");
 const PUBLIC = PUBLIC_BASE_URL ? asUrl("PUBLIC_BASE_URL", PUBLIC_BASE_URL) : null;
 const PUBLIC_PROTO = PUBLIC ? PUBLIC.protocol.replace(":", "") : "https";
 
-// Targets
 const SHOP_UPSTREAM = asUrl(
   "SHOP_UPSTREAM",
-  normalizeHttpUrl(
-    "SHOP_UPSTREAM",
-    env("SHOP_UPSTREAM"),
-    "http://srv-captain--pos360-frontend"
-  )
+  normalizeHttpUrl("SHOP_UPSTREAM", env("SHOP_UPSTREAM"), "http://srv-captain--pos360-frontend")
 );
 const APP_UPSTREAM = asUrl(
   "APP_UPSTREAM",
-  normalizeHttpUrl(
-    "APP_UPSTREAM",
-    env("APP_UPSTREAM"),
-    "http://srv-captain--pos360-admin"
-  )
+  normalizeHttpUrl("APP_UPSTREAM", env("APP_UPSTREAM"), "http://srv-captain--pos360-admin")
 );
 const API_ORIGIN = asUrl(
   "API_ORIGIN",
-  normalizeHttpUrl(
-    "API_ORIGIN",
-    env("API_ORIGIN"),
-    "http://srv-captain--pos360-commerce-api:3000"
-  )
+  normalizeHttpUrl("API_ORIGIN", env("API_ORIGIN"), "http://srv-captain--pos360-commerce-api:3000")
 );
 
 const API_V1_TARGET = new URL("/api/v1", API_ORIGIN);
 
-// ---------------- helpers ----------------
 function clientHost(req) {
   return String(req.headers.host || "");
 }
 
-// Fuerza proto público (evita http redirects)
 function forwardedProto(req) {
   if (PUBLIC_PROTO) return PUBLIC_PROTO;
   const xfp = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
@@ -102,8 +68,6 @@ function setForwardedHeaders(proxyReq, req, extra = {}) {
   proxyReq.setHeader("X-Forwarded-For", req.headers["x-forwarded-for"] || req.ip || "");
 
   Object.entries(extra).forEach(([k, v]) => proxyReq.setHeader(k, v));
-
-  // ✅ CRÍTICO: mantené el Host PUBLICO, NO el interno
   if (host) proxyReq.setHeader("Host", host);
 }
 
@@ -136,9 +100,7 @@ function rewriteAbsoluteLocationToPublic(proxyRes, req) {
     if (/^srv-captain--/i.test(u.hostname)) {
       proxyRes.headers.location = `${proto}://${host}${u.pathname}${u.search}${u.hash}`;
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
 }
 
 function rewriteLocationToApp(proxyRes) {
@@ -153,14 +115,12 @@ function rewriteSetCookiePathToApp(proxyRes) {
   const sc = proxyRes.headers["set-cookie"];
   if (!sc) return;
 
-  const fix = (cookie) =>
-    cookie.replace(/;\s*Path=\/(\s*;|$)/i, "; Path=/app$1");
-
+  const fix = (cookie) => cookie.replace(/;\s*Path=\/(\s*;|$)/i, "; Path=/app$1");
   if (Array.isArray(sc)) proxyRes.headers["set-cookie"] = sc.map(fix);
   else if (typeof sc === "string") proxyRes.headers["set-cookie"] = fix(sc);
 }
 
-// ---------------- health ----------------
+// health 200
 app.get("/health", (req, res) =>
   res.status(200).json({
     ok: true,
@@ -172,103 +132,62 @@ app.get("/health", (req, res) =>
   })
 );
 
-// ✅ ROOT: 200 (CapRover) + redirect visual a /shop/
+// root 200 (caprover) + redirect visual
 app.get("/", (_req, res) => {
-  res
-    .status(200)
-    .type("html")
-    .send(`<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta http-equiv="refresh" content="0; url=/shop/" />
-    <title>POS360</title>
-  </head>
-  <body>
-    <script>location.replace('/shop/');</script>
-    <noscript><a href="/shop/">Ir a /shop/</a></noscript>
-  </body>
-</html>`);
+  res.status(200).type("html").send(`<!doctype html>
+<html><head><meta charset="utf-8" /><meta http-equiv="refresh" content="0; url=/shop/" /></head>
+<body><script>location.replace('/shop/');</script><noscript><a href="/shop/">/shop/</a></noscript></body></html>`);
 });
 
-// ---------------- /api/v1 passthrough ----------------
-app.use(
-  "/api/v1",
-  createProxyMiddleware({
-    target: API_ORIGIN,
-    changeOrigin: true,
-    xfwd: true,
-    logLevel: LOG_LEVEL,
-    onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req);
-    },
-    onProxyRes(proxyRes, req) {
-      rewriteAbsoluteLocationToPublic(proxyRes, req);
-    },
-    onError: proxyError("api-v1"),
-  })
-);
+app.use("/api/v1", createProxyMiddleware({
+  target: API_ORIGIN,
+  changeOrigin: true,
+  xfwd: true,
+  logLevel: LOG_LEVEL,
+  onProxyReq(proxyReq, req) { setForwardedHeaders(proxyReq, req); },
+  onProxyRes(proxyRes, req) { rewriteAbsoluteLocationToPublic(proxyRes, req); },
+  onError: proxyError("api-v1"),
+}));
 
-// ---------------- /api alias -> /api/v1 ----------------
-app.use(
-  "/api",
-  createProxyMiddleware({
-    target: API_V1_TARGET,
-    changeOrigin: true,
-    xfwd: true,
-    logLevel: LOG_LEVEL,
-    pathRewrite: (p) => p.replace(/^\/api/, "") || "/",
-    onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req);
-    },
-    onProxyRes(proxyRes, req) {
-      rewriteAbsoluteLocationToPublic(proxyRes, req);
-    },
-    onError: proxyError("api"),
-  })
-);
+app.use("/api", createProxyMiddleware({
+  target: API_V1_TARGET,
+  changeOrigin: true,
+  xfwd: true,
+  logLevel: LOG_LEVEL,
+  pathRewrite: (p) => p.replace(/^\/api/, "") || "/",
+  onProxyReq(proxyReq, req) { setForwardedHeaders(proxyReq, req); },
+  onProxyRes(proxyRes, req) { rewriteAbsoluteLocationToPublic(proxyRes, req); },
+  onError: proxyError("api"),
+}));
 
-// ---------------- /app -> admin ----------------
-app.use(
-  "/app",
-  createProxyMiddleware({
-    target: APP_UPSTREAM,
-    changeOrigin: false,
-    xfwd: true,
-    logLevel: LOG_LEVEL,
-    pathRewrite: (p) => p.replace(/^\/app/, "") || "/",
-    onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/app" });
-    },
-    onProxyRes(proxyRes, req) {
-      rewriteLocationToApp(proxyRes);
-      rewriteSetCookiePathToApp(proxyRes);
-      rewriteAbsoluteLocationToPublic(proxyRes, req);
-    },
-    onError: proxyError("app"),
-  })
-);
+app.use("/app", createProxyMiddleware({
+  target: APP_UPSTREAM,
+  changeOrigin: false,
+  xfwd: true,
+  logLevel: LOG_LEVEL,
+  pathRewrite: (p) => p.replace(/^\/app/, "") || "/",
+  onProxyReq(proxyReq, req) { setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/app" }); },
+  onProxyRes(proxyRes, req) {
+    rewriteLocationToApp(proxyRes);
+    rewriteSetCookiePathToApp(proxyRes);
+    rewriteAbsoluteLocationToPublic(proxyRes, req);
+  },
+  onError: proxyError("app"),
+}));
 
-// ---------------- /shop -> frontend ----------------
-app.use(
-  "/shop",
-  createProxyMiddleware({
-    target: SHOP_UPSTREAM,
-    changeOrigin: false,
-    xfwd: true,
-    logLevel: LOG_LEVEL,
-    onProxyReq(proxyReq, req) {
-      setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/shop" });
-    },
-    onProxyRes(proxyRes, req) {
-      normalizeShopLocation(proxyRes);
-      rewriteAbsoluteLocationToPublic(proxyRes, req);
-    },
-    onError: proxyError("shop"),
-  })
-);
+app.use("/shop", createProxyMiddleware({
+  target: SHOP_UPSTREAM,
+  changeOrigin: false,
+  xfwd: true,
+  logLevel: LOG_LEVEL,
+  onProxyReq(proxyReq, req) { setForwardedHeaders(proxyReq, req, { "X-Forwarded-Prefix": "/shop" }); },
+  onProxyRes(proxyRes, req) {
+    normalizeShopLocation(proxyRes);
+    rewriteAbsoluteLocationToPublic(proxyRes, req);
+  },
+  onError: proxyError("shop"),
+}));
 
-// fallback
 app.use((_req, res) => res.redirect(302, "/shop/"));
 
 app.listen(PORT, "0.0.0.0", () => {
