@@ -1,16 +1,17 @@
 /**
- * ✅ pos360-edge/server.js (COPY-PASTE FINAL)
+ * ✅ pos360-edge/server.js (COPY-PASTE FINAL DEFINITIVO)
  *
  * Routing:
- * - /            -> redirect to /shop/
+ * - /            -> 301 -> /shop/
  * - /shop/*      -> FRONTEND (shop)
  * - /app/*       -> FRONTEND (backoffice vive en el mismo frontend)
  * - /api/*       -> API
  *
- * Fix CRÍTICO:
- * - Express al montar "/shop" recorta el prefijo => el proxy le pega al upstream "/"
- *   y el frontend redirige "/" -> "/shop/" => loop/302/301.
- * - Solución: pathRewrite para volver a prefijar "/shop" y "/app".
+ * Fixes:
+ * - trust proxy => detecta https correctamente
+ * - fuerza X-Forwarded-Proto=https cuando corresponde
+ * - reescribe Location: http://srv-... -> https://tu-dominio
+ * - FIX CLAVE: /shop/* en edge pega contra upstream /shop/* (no contra /)
  */
 
 const express = require("express");
@@ -33,11 +34,15 @@ const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com").
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
 const APP_UPSTREAM  = env("APP_UPSTREAM",  SHOP_UPSTREAM).replace(/\/+$/, "");
 
-const API_UPSTREAM  = env("API_UPSTREAM", "http://srv-captain--pos360-commerce-api:3000/api/v1").replace(/\/+$/, "");
+const API_UPSTREAM = env("API_UPSTREAM", "http://srv-captain--pos360-commerce-api:3000/api/v1").replace(/\/+$/, "");
 const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
+function firstHeaderValue(v) {
+  return (v || "").toString().split(",")[0].trim();
+}
+
 function isHttps(req) {
-  const xfProto = (req.headers["x-forwarded-proto"] || "").toString().split(",")[0].trim();
+  const xfProto = firstHeaderValue(req.headers["x-forwarded-proto"]);
   if (xfProto) return xfProto === "https";
   return req.protocol === "https";
 }
@@ -61,9 +66,12 @@ function rewriteLocationToPublic(proxyRes, req) {
   newLoc = newLoc.replace(/^http:\/\/127\.0\.0\.1(?=\/|$)/i, `https://${host}`);
 
   // upgrade http://host -> https://host
-  newLoc = newLoc.replace(new RegExp(`^http:\\/\\/${host.replace(/\./g, "\\.")}(?=\\/|$)`, "i"), `https://${host}`);
+  newLoc = newLoc.replace(
+    new RegExp(`^http:\\/\\/${host.replace(/\./g, "\\.")}(?=\\/|$)`, "i"),
+    `https://${host}`
+  );
 
-  // si request era https, fuerza https
+  // si el request original fue https, subimos cualquier http://
   if (isHttps(req)) newLoc = newLoc.replace(/^http:\/\//i, "https://");
 
   if (newLoc !== loc) proxyRes.headers["location"] = newLoc;
@@ -82,21 +90,9 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ===== Root -> /shop/ =====
+// ===== Root -> /shop/ (HTTP redirect real) =====
 app.get("/", (req, res) => {
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta http-equiv="refresh" content="0; url=/shop/" />
-  <title>pos360-edge</title>
-</head>
-<body>
-  <script>location.replace('/shop/');</script>
-  <noscript><a href="/shop/">/shop/</a></noscript>
-</body>
-</html>`);
+  res.redirect(301, "/shop/");
 });
 
 // ===== /api -> API =====
@@ -113,7 +109,8 @@ app.use(
   })
 );
 
-// ✅ /shop -> FRONTEND (RE-PREFIX FIX)
+// ===== /shop -> FRONTEND =====
+// FIX: upstream vive en /shop, entonces /shop/* => /shop/* (no /)
 app.use(
   "/shop",
   createProxyMiddleware({
@@ -123,12 +120,13 @@ app.use(
     xfwd: true,
     onProxyReq: forceForwardProto,
     onProxyRes: rewriteLocationToPublic,
-    // Express recorta "/shop" => acá lo volvemos a poner:
-    pathRewrite: (path) => `/shop${path}`,
+    pathRewrite: (path) => `/shop${path}`, // ✅ CLAVE
   })
 );
 
-// ✅ /app -> FRONTEND (RE-PREFIX FIX)
+// ===== /app -> FRONTEND (backoffice en el mismo frontend) =====
+// Si tu backoffice vive bajo /app en el frontend: /app/* => /app/*
+// Si en realidad vive en /app dentro del build del frontend, esto queda OK.
 app.use(
   "/app",
   createProxyMiddleware({
@@ -138,8 +136,8 @@ app.use(
     xfwd: true,
     onProxyReq: forceForwardProto,
     onProxyRes: rewriteLocationToPublic,
-    // Express recorta "/app" => acá lo volvemos a poner:
-    pathRewrite: (path) => `/app${path}`,
+    // si tu backoffice realmente está montado en otra ruta interna, reescribí acá:
+    // pathRewrite: (path) => path.replace(/^\/app/, "/shop/app")
   })
 );
 
