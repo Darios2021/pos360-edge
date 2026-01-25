@@ -1,12 +1,11 @@
 /**
- * ✅ pos360-edge/server.js — FINAL DEFINITIVO ANTI-SELF-301
- * Proyecto: POS360 / sanjuantecnologia.com
+ * ✅ pos360-edge/server.js — FINAL DEFINITIVO (ANTI 301 LOOP)
+ * POS360 / sanjuantecnologia.com
  *
- * Objetivos:
- * - Evitar bucles 301 /shop/ -> /shop/ (self-redirect)
- * - Proxy robusto para /shop (cubre /shop y /shop/*)
- * - Forense: identificar quién intenta redirigir
- * - Trust proxy correcto para CapRover/Nginx
+ * - NO redirects en /shop/
+ * - Proxy /shop -> frontend (strip prefix)
+ * - / (raíz) se sirve como shop SIN 301 (proxy interno)
+ * - Reescritura de Location para mantener /shop
  */
 
 const express = require("express");
@@ -14,15 +13,12 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
 
-// 🔑 Detrás de CapRover/Nginx esto es obligatorio
+// 🔑 Detrás de CapRover/Nginx
 app.set("trust proxy", true);
 
-// ❌ No usar strict routing en edge proxy (reduce problemas con trailing slash)
-// app.set("strict routing", true);
-
-/* =========================
- * ENV helpers
- * ========================= */
+// =========================
+// ENV helpers
+// =========================
 function env(name, fallback) {
   const v = process.env[name];
   return v !== undefined && v !== null && String(v).trim() !== ""
@@ -37,13 +33,11 @@ const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com").
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
 const APP_UPSTREAM = env("APP_UPSTREAM", "http://srv-captain--pos360-admin").replace(/\/+$/, "");
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000").replace(/\/+$/, "");
+const EDGE_BUILD = env("EDGE_BUILD", "EDGE_FINAL_ANTI_301_LOOP_2026-01-25_02");
 
-// ✅ marca de build para confirmar que corrió este código
-const EDGE_BUILD = env("EDGE_BUILD", "EDGE_ANTI_SELF_301_2026-01-25_01");
-
-/* =========================
- * HTTP helpers
- * ========================= */
+// =========================
+// HTTP helpers
+// =========================
 function getHost(req) {
   return (req.headers["x-forwarded-host"] || req.headers.host || "")
     .toString()
@@ -61,111 +55,68 @@ function isHttps(req) {
   return xfProto === "https" || req.protocol === "https" || req.secure === true;
 }
 
-function forceForwardHeaders(proxyReq, req) {
-  const host = getHost(req);
-  proxyReq.setHeader("X-Forwarded-Proto", isHttps(req) ? "https" : "http");
-  if (host) proxyReq.setHeader("X-Forwarded-Host", host);
-}
-
 /**
- * 🔁 Reescritura defensiva de Location para evitar redirects internos
+ * 🔁 Reescritura defensiva de Location
+ * - Si upstream devuelve Location: /login -> lo convertimos a /shop/login (o /app/login)
+ * - Si devuelve absoluto interno, lo convertimos al host público
  */
-function rewriteLocation(proxyRes, req) {
-  const loc = proxyRes.headers?.location;
-  if (!loc || String(loc).startsWith("/")) return;
+function rewriteLocationFactory({ publicPrefix }) {
+  return function rewriteLocation(proxyRes, req) {
+    const loc = proxyRes.headers?.location;
+    if (!loc) return;
 
-  const host = getHost(req);
-  if (!host) return;
+    const host = getHost(req);
+    if (!host) return;
 
-  let newLoc = String(loc);
+    let newLoc = String(loc);
 
-  const targets = [
-    /https?:\/\/srv-captain--pos360-frontend(?=\/|$)/i,
-    /https?:\/\/srv-captain--pos360-admin(?=\/|$)/i,
-    /https?:\/\/srv-captain--pos360-edge(?=\/|$)/i,
-    /https?:\/\/127\.0\.0\.1(?=\/|$)/i,
-    /https?:\/\/localhost(?=\/|$)/i,
-  ];
-
-  targets.forEach((rx) => {
-    newLoc = newLoc.replace(rx, `https://${host}`);
-  });
-
-  if (isHttps(req)) {
-    const escHost = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    newLoc = newLoc.replace(new RegExp(`^http:\\/\\/${escHost}(?=\\/|$)`, "i"), `https://${host}`);
-  }
-
-  proxyRes.headers.location = newLoc;
-}
-
-/* =========================
- * 0) FORENSE: detectar redirects
- * ========================= */
-app.use((req, res, next) => {
-  const rid = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-
-  // Si Express intenta redirigir /shop/ -> /shop/ (self redirect), lo bloqueamos
-  // Esto mata el loop aunque haya quedado middleware viejo en algún lado.
-  const _redirect = res.redirect.bind(res);
-  res.redirect = function (a, b) {
-    const status = typeof a === "number" ? a : 302;
-    const url = typeof a === "number" ? b : a;
-
-    // Normalizamos url a string
-    const target = (url ?? "").toString();
-
-    if (
-      status === 301 &&
-      req.originalUrl === "/shop/" &&
-      (target === "/shop/" || target === `${PUBLIC_BASE_URL}/shop/`)
-    ) {
-      console.log("🧨 BLOCKED SELF-301", {
-        rid,
-        status,
-        from: req.originalUrl,
-        to: target,
-        xfProto: req.headers["x-forwarded-proto"],
-        protocol: req.protocol,
-        secure: req.secure,
-      });
-      // respondemos 200 vacío (o podés cambiar a next() si querés que el proxy responda)
-      res.status(200).end();
+    // 1) Si el upstream devuelve "/algo", lo mantenemos en el namespace público (/shop o /app)
+    if (newLoc.startsWith("/")) {
+      // Evita duplicar
+      if (publicPrefix && !newLoc.startsWith(publicPrefix + "/") && newLoc !== publicPrefix) {
+        newLoc = publicPrefix + newLoc;
+      }
+      proxyRes.headers.location = newLoc;
       return;
     }
 
-    console.log("↪️ RES.REDIRECT", {
-      rid,
-      status,
-      to: target,
-      from: req.originalUrl,
-      xfProto: req.headers["x-forwarded-proto"],
-      protocol: req.protocol,
-      secure: req.secure,
+    // 2) Si viene absoluto interno, lo pasamos a https://host y con prefijo público si aplica
+    const targets = [
+      /https?:\/\/srv-captain--pos360-frontend(?=\/|$)/i,
+      /https?:\/\/srv-captain--pos360-admin(?=\/|$)/i,
+      /https?:\/\/srv-captain--pos360-edge(?=\/|$)/i,
+      /https?:\/\/127\.0\.0\.1(?=\/|$)/i,
+      /https?:\/\/localhost(?=\/|$)/i,
+    ];
+
+    targets.forEach((rx) => {
+      newLoc = newLoc.replace(rx, `https://${host}`);
     });
 
-    return _redirect(status, url);
+    // forzar https si corresponde
+    if (isHttps(req)) {
+      const hostEsc = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      newLoc = newLoc.replace(new RegExp(`^http:\\/\\/${hostEsc}(?=\\/|$)`, "i"), `https://${host}`);
+    }
+
+    // Si quedó absoluto al host, y tiene path /algo, lo pasamos a /shop/algo o /app/algo
+    try {
+      const u = new URL(newLoc);
+      if (publicPrefix && u.pathname && u.pathname.startsWith("/") && !u.pathname.startsWith(publicPrefix + "/")) {
+        u.pathname = publicPrefix + u.pathname;
+        newLoc = u.toString();
+      }
+    } catch (_) {
+      // ignore
+    }
+
+    proxyRes.headers.location = newLoc;
   };
+}
 
-  // Log mínimo útil
-  if (req.originalUrl.startsWith("/shop")) {
-    console.log("➡️ REQ", {
-      rid,
-      url: req.originalUrl,
-      host: req.headers.host,
-      xfHost: req.headers["x-forwarded-host"],
-      xfProto: req.headers["x-forwarded-proto"],
-      protocol: req.protocol,
-      secure: req.secure,
-    });
-  }
-
-  next();
-});
-
-/* =========================
- * 1) Health Check (con build ID)
- * ========================= */
+// =========================
+// Health Check
+// =========================
 app.get("/health", (req, res) => {
   res.setHeader("X-EDGE-BUILD", EDGE_BUILD);
   res.json({
@@ -178,16 +129,11 @@ app.get("/health", (req, res) => {
   });
 });
 
-/* =========================
- * 2) Único redirect permitido: raíz → /shop/
- * ========================= */
-app.get("/", (req, res) => {
-  return res.redirect(301, "/shop/");
-});
+// =========================
+// PROXIES
+// =========================
 
-/* =========================
- * 3) API Proxy (/api -> API_ORIGIN)
- * ========================= */
+// ---- API: /api -> API_ORIGIN (strip /api)
 app.use(
   "/api",
   createProxyMiddleware({
@@ -196,29 +142,11 @@ app.use(
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
     pathRewrite: { "^/api": "" },
-    onProxyReq: forceForwardHeaders,
-    onProxyRes: rewriteLocation,
+    onProxyRes: rewriteLocationFactory({ publicPrefix: "" }),
   })
 );
 
-/* =========================
- * 4) SHOP Proxy (clave): /shop cubre /shop y /shop/*
- * ========================= */
-app.use(
-  "/shop",
-  createProxyMiddleware({
-    target: SHOP_UPSTREAM,
-    changeOrigin: true,
-    logLevel: PROXY_LOG_LEVEL,
-    xfwd: true,
-    onProxyReq: forceForwardHeaders,
-    onProxyRes: rewriteLocation,
-  })
-);
-
-/* =========================
- * 5) APP / Backoffice (/app ...)
- * ========================= */
+// ---- APP: /app -> APP_UPSTREAM (strip /app)
 app.use(
   "/app",
   createProxyMiddleware({
@@ -226,11 +154,48 @@ app.use(
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
-    onProxyReq: forceForwardHeaders,
-    onProxyRes: rewriteLocation,
+    pathRewrite: (path) => {
+      const out = path.replace(/^\/app(\/|$)/, "/");
+      return out === "" ? "/" : out;
+    },
+    onProxyRes: rewriteLocationFactory({ publicPrefix: "/app" }),
+  })
+);
+
+// ---- SHOP: /shop -> SHOP_UPSTREAM (strip /shop)
+app.use(
+  "/shop",
+  createProxyMiddleware({
+    target: SHOP_UPSTREAM,
+    changeOrigin: true,
+    logLevel: PROXY_LOG_LEVEL,
+    xfwd: true,
+    // 🔥 CLAVE: strip /shop para que el frontend upstream siempre vea "/" como base
+    pathRewrite: (path) => {
+      const out = path.replace(/^\/shop(\/|$)/, "/");
+      return out === "" ? "/" : out;
+    },
+    onProxyRes: rewriteLocationFactory({ publicPrefix: "/shop" }),
+  })
+);
+
+// =========================
+// RAÍZ: servir shop SIN 301
+// =========================
+// En vez de redirect 301, proxy directo al frontend con path "/"
+app.use(
+  "/",
+  createProxyMiddleware({
+    target: SHOP_UPSTREAM,
+    changeOrigin: true,
+    logLevel: PROXY_LOG_LEVEL,
+    xfwd: true,
+    // raíz siempre al index del frontend
+    pathRewrite: () => "/",
+    onProxyRes: rewriteLocationFactory({ publicPrefix: "/shop" }),
   })
 );
 
 app.listen(PORT, () => {
-  console.log(`✅ pos360-edge LISTEN ${PORT} build=${EDGE_BUILD}`);
+  console.log(`✅ pos360-edge FINAL ANTI-301 loop en ${PORT} build=${EDGE_BUILD}`);
 });
