@@ -1,11 +1,10 @@
 /**
- * ✅ pos360-edge/server.js — PROD FINAL
- * Orden de middlewares CRÍTICO:
- * 1) /shop/ proxy (PRIMERO)
- * 2) /api proxy
- * 3) /app proxy
- * 4) redirects simples
- * 5) fallback
+ * ✅ pos360-edge/server.js — PROD FINAL (NO LOOP)
+ * - /shop/  -> PROXY al frontend (PRIMERO)
+ * - /shop   -> 301 a /shop/ (solo este)
+ * - /       -> 301 a /shop/
+ * - /api    -> PROXY a API
+ * - /app/   -> PROXY a Admin
  */
 
 const express = require("express");
@@ -24,25 +23,25 @@ const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
-const APP_UPSTREAM  = env("APP_UPSTREAM", "http://srv-captain--pos360-adminer").replace(/\/+$/, "");
+const APP_UPSTREAM  = env("APP_UPSTREAM", "http://srv-captain--pos360-admin").replace(/\/+$/, "");
 const API_ORIGIN    = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000").replace(/\/+$/, "");
 
 app.set("trust proxy", true);
 
-// Health
+// ---- Health
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_PROD_FINAL_01"));
+  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_PROD_FINAL_NO_LOOP_01"));
   res.json({
     ok: true,
     service: "pos360-edge",
-    build: env("X_EDGE_BUILD", "EDGE_PROD_FINAL_01"),
+    build: env("X_EDGE_BUILD", "EDGE_PROD_FINAL_NO_LOOP_01"),
     shopUpstream: SHOP_UPSTREAM,
     appUpstream: APP_UPSTREAM,
     apiOrigin: API_ORIGIN,
   });
 });
 
-// ✅ 1) SHOP PROXY PRIMERO (prioridad absoluta)
+// ✅ 1) SHOP PROXY PRIMERO: /shop/ JAMÁS debe redirigir
 app.use(
   "/shop/",
   createProxyMiddleware({
@@ -50,10 +49,7 @@ app.use(
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
-    onProxyReq(proxyReq, req) {
-      // Guard anti-loop: si alguna capa mete Location /shop/ la evitamos en upstream
-      proxyReq.setHeader("X-Edge-Proxy", "shop");
-    },
+    // importante: NO pathRewrite acá
     onProxyRes(proxyRes) {
       proxyRes.headers["X-EDGE-PROXY"] = "shop";
     },
@@ -89,7 +85,7 @@ app.use(
   })
 );
 
-// ✅ 4) Redirects simples
+// ✅ 4) Redirects SOLO para / y /shop (sin slash)
 app.get("/", (req, res) => res.redirect(301, "/shop/"));
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 
@@ -98,4 +94,4 @@ app.use((req, res) => {
   res.status(404).type("text/plain").send("edge: not found");
 });
 
-app.listen(PORT, () => console.log(`✅ pos360-edge PROD en :${PORT}`));
+app.listen(PORT, () => console.log(`✅ pos360-edge PROD FINAL en :${PORT}`));
