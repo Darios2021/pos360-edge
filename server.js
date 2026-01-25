@@ -1,10 +1,6 @@
 /**
- * ✅ pos360-edge/server.js — FINAL TRACE + ANTI SELF-301 LOOP
- *
- * Objetivo:
- * - Detectar quién genera el 301 a /shop/ (loop)
- * - Evitar el self-redirect (Location: /shop/) dentro del mismo request
- * - Mantener /api y /app funcionando
+ * ✅ pos360-edge/server.js — FINAL DEFINITIVO
+ * HOOK: bloquea 301/302 self-redirect a /shop/ aunque NO venga de res.redirect()
  */
 
 const express = require("express");
@@ -29,80 +25,72 @@ const API_ORIGIN    = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api
 app.set("trust proxy", true);
 
 // =======================
-// 1) TRACE MIDDLEWARE
+// HOOK GLOBAL: Cazar self-301
 // =======================
 app.use((req, res, next) => {
-  const p = req.originalUrl || req.url || "";
-  if (p.startsWith("/shop")) {
-    console.log("🧭 TRACE /shop*",
-      JSON.stringify({
-        method: req.method,
-        originalUrl: req.originalUrl,
-        url: req.url,
-        baseUrl: req.baseUrl,
-        path: req.path,
-        host: req.headers.host,
-        xfh: req.headers["x-forwarded-host"],
-        xfp: req.headers["x-forwarded-proto"],
-        xf_for: req.headers["x-forwarded-for"],
-        proto: req.protocol,
-      })
-    );
-  }
+  const from = (req.originalUrl || req.url || "").toString();
 
-  // Hook para detectar redirect interno
-  const _redirect = res.redirect.bind(res);
-  res.redirect = (statusOrUrl, maybeUrl) => {
-    let status = 302;
-    let url = statusOrUrl;
+  const _writeHead = res.writeHead.bind(res);
+  res.writeHead = (statusCode, statusMessage, headers) => {
+    // Normalizar params
+    let code = statusCode;
+    let hdrs = headers;
 
-    if (typeof statusOrUrl === "number") {
-      status = statusOrUrl;
-      url = maybeUrl;
+    if (typeof statusMessage === "object" && statusMessage !== null) {
+      hdrs = statusMessage;
     }
 
-    // 🔥 ANTI-LOOP: si alguien intenta redirigir a /shop/ desde /shop/
-    const from = (req.originalUrl || "").toString();
-    const to = (url || "").toString();
+    const location =
+      (hdrs && (hdrs.Location || hdrs.location)) ||
+      res.getHeader("Location") ||
+      res.getHeader("location");
 
-    if ((status === 301 || status === 302) && to === "/shop/" && from.startsWith("/shop/")) {
-      console.log("🛑 BLOCKED SELF-REDIRECT", { status, from, to });
-      // En vez de redirigir, dejamos continuar: proxy
-      // Mandamos un header para verlo desde afuera
-      res.setHeader("X-EDGE-BLOCKED-REDIRECT", "1");
-      return next();
+    // 🔥 Detectar loop: estando en /shop/ y queriendo Location /shop/
+    if ((code === 301 || code === 302) && String(location || "") === "/shop/" && from.startsWith("/shop/")) {
+      // Log con stack para saber QUIÉN lo setea
+      const stack = new Error("SELF_301_STACK").stack;
+      console.log("🛑 BLOCK SELF 301", JSON.stringify({ from, code, location }));
+      console.log(stack);
+
+      // Bloqueo real: convertir en 200 y borrar Location
+      res.setHeader("X-EDGE-BLOCKED-REDIRECT", "WRITEHEAD");
+      try { res.removeHeader("Location"); } catch {}
+      try { res.removeHeader("location"); } catch {}
+
+      // Si venían headers, limpiarlos también
+      if (hdrs) {
+        delete hdrs.Location;
+        delete hdrs.location;
+      }
+
+      // Mandar 200 OK en vez de 301
+      return _writeHead(200, hdrs);
     }
 
-    return _redirect(statusOrUrl, maybeUrl);
+    return _writeHead(statusCode, statusMessage, headers);
   };
 
   next();
 });
 
 // =======================
-// 2) HEALTH
+// HEALTH
 // =======================
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_TRACE_ANTI_LOOP_01"));
+  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_WRITEHEAD_BLOCK_01"));
   res.json({
     ok: true,
     service: "pos360-edge",
-    build: env("X_EDGE_BUILD", "EDGE_TRACE_ANTI_LOOP_01"),
+    build: env("X_EDGE_BUILD", "EDGE_WRITEHEAD_BLOCK_01"),
     shopUpstream: SHOP_UPSTREAM,
     appUpstream: APP_UPSTREAM,
     apiOrigin: API_ORIGIN,
   });
 });
 
-// =======================
-// 3) ROOT + /shop (sin slash)
-// =======================
+// ROOT y /shop (sin slash)
 app.get("/", (req, res) => res.redirect(301, "/shop/"));
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
-
-// =======================
-// 4) PROXIES
-// =======================
 
 // API
 app.use(
@@ -119,7 +107,7 @@ app.use(
   })
 );
 
-// SHOP (NO tocar redirects acá)
+// SHOP
 app.use(
   "/shop/",
   createProxyMiddleware({
@@ -147,11 +135,9 @@ app.use(
   })
 );
 
-// Fallback (para ver si algo cae acá)
-app.use((req, res) => {
-  res.status(404).send("edge: not found");
-});
+// fallback
+app.use((req, res) => res.status(404).send("edge: not found"));
 
 app.listen(PORT, () => {
-  console.log(`✅ pos360-edge TRACE+ANTI-LOOP en :${PORT}`);
+  console.log(`✅ pos360-edge WRITEHEAD BLOCK en :${PORT}`);
 });
