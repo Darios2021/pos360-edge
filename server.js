@@ -1,16 +1,16 @@
 /**
- * ✅ pos360-edge/server.js (COPY-PASTE FINAL DEFINITIVO)
+ * ✅ pos360-edge/server.js (COPY-PASTE FINAL)
  *
  * Routing:
  * - /            -> redirect to /shop/
  * - /shop/*      -> FRONTEND (shop)
- * - /app/*       -> FRONTEND (backoffice en el mismo frontend)
- * - /api/*       -> API (/api/v1)
+ * - /app/*       -> FRONTEND (backoffice vive en el mismo frontend)
+ * - /api/*       -> API
  *
  * Fix CRÍTICO:
- * - http-proxy-middleware (versiones nuevas) => usar "on: { proxyReq, proxyRes }"
- * - ✅ fuerza Host público al upstream (evita redirects a srv-captain--)
- * - ✅ reescribe Location: http://srv-captain--... -> https://sanjuantecnologia.com/...
+ * - Express al montar "/shop" recorta el prefijo => el proxy le pega al upstream "/"
+ *   y el frontend redirige "/" -> "/shop/" => loop/302/301.
+ * - Solución: pathRewrite para volver a prefijar "/shop" y "/app".
  */
 
 const express = require("express");
@@ -29,18 +29,11 @@ function env(name, fallback) {
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com").replace(/\/+$/, "");
-const PUBLIC_HOST = (() => {
-  try {
-    return new URL(PUBLIC_BASE_URL).host;
-  } catch {
-    return "sanjuantecnologia.com";
-  }
-})();
 
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
-const APP_UPSTREAM  = env("APP_UPSTREAM",  "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
-const API_UPSTREAM  = env("API_UPSTREAM",  "http://srv-captain--pos360-commerce-api:3000/api/v1").replace(/\/+$/, "");
+const APP_UPSTREAM  = env("APP_UPSTREAM",  SHOP_UPSTREAM).replace(/\/+$/, "");
 
+const API_UPSTREAM  = env("API_UPSTREAM", "http://srv-captain--pos360-commerce-api:3000/api/v1").replace(/\/+$/, "");
 const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
 function isHttps(req) {
@@ -49,58 +42,31 @@ function isHttps(req) {
   return req.protocol === "https";
 }
 
-function setForwardHeaders(proxyReq, req) {
-  const https = isHttps(req);
-  const host = (req.headers.host || PUBLIC_HOST || "").toString();
-
-  // ✅ CLAVE: upstream arma redirect con Host, así que lo pisamos
-  proxyReq.setHeader("Host", host);
-
-  proxyReq.setHeader("X-Forwarded-Proto", https ? "https" : "http");
-  proxyReq.setHeader("X-Forwarded-Host", host);
-
-  const xfPort = (req.headers["x-forwarded-port"] || "").toString().trim();
-  if (!xfPort) proxyReq.setHeader("X-Forwarded-Port", https ? "443" : "80");
+function forceForwardProto(proxyReq, req) {
+  proxyReq.setHeader("X-Forwarded-Proto", isHttps(req) ? "https" : "http");
+  proxyReq.setHeader("X-Forwarded-Host", req.headers.host || "");
 }
 
-function rewriteLocation(proxyRes, req) {
-  const loc = proxyRes.headers?.location;
+function rewriteLocationToPublic(proxyRes, req) {
+  const loc = proxyRes.headers["location"];
   if (!loc) return;
 
-  const host = (req.headers.host || PUBLIC_HOST || "").toString();
+  const host = req.headers.host;
   if (!host) return;
 
-  let newLoc = String(loc);
+  let newLoc = loc;
 
-  // ✅ host interno -> host público
+  // servicios internos -> host público
   newLoc = newLoc.replace(/^http:\/\/srv-captain--pos360-frontend(?=\/|$)/i, `https://${host}`);
-  newLoc = newLoc.replace(/^https:\/\/srv-captain--pos360-frontend(?=\/|$)/i, `https://${host}`);
+  newLoc = newLoc.replace(/^http:\/\/127\.0\.0\.1(?=\/|$)/i, `https://${host}`);
 
-  // ✅ si request original era https, upgrade cualquier http
-  if (isHttps(req)) {
-    newLoc = newLoc.replace(/^http:\/\//i, "https://");
-  }
+  // upgrade http://host -> https://host
+  newLoc = newLoc.replace(new RegExp(`^http:\\/\\/${host.replace(/\./g, "\\.")}(?=\\/|$)`, "i"), `https://${host}`);
 
-  if (newLoc !== loc) proxyRes.headers.location = newLoc;
-}
+  // si request era https, fuerza https
+  if (isHttps(req)) newLoc = newLoc.replace(/^http:\/\//i, "https://");
 
-function makeProxy(target, { stripPrefix } = {}) {
-  return createProxyMiddleware({
-    target,
-    changeOrigin: true,
-    logLevel: PROXY_LOG_LEVEL,
-    xfwd: true,
-
-    // ✅ API NUEVA (http-proxy-middleware)
-    on: {
-      proxyReq: (proxyReq, req) => setForwardHeaders(proxyReq, req),
-      proxyRes: (proxyRes, req) => rewriteLocation(proxyRes, req),
-    },
-
-    pathRewrite: stripPrefix
-      ? (path) => path.replace(stripPrefix, "")
-      : undefined,
-  });
+  if (newLoc !== loc) proxyRes.headers["location"] = newLoc;
 }
 
 // ===== Health =====
@@ -133,19 +99,54 @@ app.get("/", (req, res) => {
 </html>`);
 });
 
-// ===== /api -> API (/api/v1) =====
-app.use("/api", makeProxy(API_UPSTREAM, { stripPrefix: /^\/api/ }));
+// ===== /api -> API =====
+app.use(
+  "/api",
+  createProxyMiddleware({
+    target: API_UPSTREAM,
+    changeOrigin: true,
+    logLevel: PROXY_LOG_LEVEL,
+    xfwd: true,
+    onProxyReq: forceForwardProto,
+    onProxyRes: rewriteLocationToPublic,
+    pathRewrite: (path) => path.replace(/^\/api/, ""),
+  })
+);
 
-// ===== /shop -> FRONTEND =====
-app.use("/shop", makeProxy(SHOP_UPSTREAM));
+// ✅ /shop -> FRONTEND (RE-PREFIX FIX)
+app.use(
+  "/shop",
+  createProxyMiddleware({
+    target: SHOP_UPSTREAM,
+    changeOrigin: true,
+    logLevel: PROXY_LOG_LEVEL,
+    xfwd: true,
+    onProxyReq: forceForwardProto,
+    onProxyRes: rewriteLocationToPublic,
+    // Express recorta "/shop" => acá lo volvemos a poner:
+    pathRewrite: (path) => `/shop${path}`,
+  })
+);
 
-// ===== /app -> FRONTEND =====
-app.use("/app", makeProxy(APP_UPSTREAM));
+// ✅ /app -> FRONTEND (RE-PREFIX FIX)
+app.use(
+  "/app",
+  createProxyMiddleware({
+    target: APP_UPSTREAM,
+    changeOrigin: true,
+    logLevel: PROXY_LOG_LEVEL,
+    xfwd: true,
+    onProxyReq: forceForwardProto,
+    onProxyRes: rewriteLocationToPublic,
+    // Express recorta "/app" => acá lo volvemos a poner:
+    pathRewrite: (path) => `/app${path}`,
+  })
+);
 
 app.listen(PORT, () => {
   console.log(`✅ pos360-edge on :${PORT}`);
-  console.log(`shop -> ${SHOP_UPSTREAM}/`);
-  console.log(`app  -> ${APP_UPSTREAM}/`);
+  console.log(`shop -> ${SHOP_UPSTREAM}/shop/`);
+  console.log(`app  -> ${APP_UPSTREAM}/app/`);
   console.log(`api  -> ${API_UPSTREAM}`);
   console.log(`public -> ${PUBLIC_BASE_URL}`);
 });
