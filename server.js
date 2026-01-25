@@ -1,11 +1,11 @@
 /**
- * ✅ pos360-edge/server.js — COPY-PASTE FINAL (FIX LOOP /shop/)
+ * ✅ pos360-edge/server.js — COPY-PASTE FINAL (NO LOOP /shop/)
  *
  * Routing:
  * - /            -> 301 /shop/
- * - /shop        -> 301 /shop/        (SOLO exacto, no /shop/)
- * - /shop/*      -> FRONTEND
- * - /app/*       -> FRONTEND
+ * - /shop        -> 301 /shop/        (exacto por req.path)
+ * - /shop/*      -> FRONTEND (proxy)
+ * - /app/*       -> FRONTEND (proxy)
  * - /api/*       -> API (API_ORIGIN)
  */
 
@@ -28,7 +28,7 @@ const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com").replace(/\/+$/, "");
 
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
-const APP_UPSTREAM  = env("APP_UPSTREAM", SHOP_UPSTREAM).replace(/\/+$/, "");
+const APP_UPSTREAM = env("APP_UPSTREAM", SHOP_UPSTREAM).replace(/\/+$/, "");
 
 // ✅ host:puerto (SIN /api, SIN /v1)
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000").replace(/\/+$/, "");
@@ -73,34 +73,20 @@ function rewriteLocation(proxyRes, req) {
 
   let newLoc = String(loc);
 
-  newLoc = newLoc.replace(
-    /^https?:\/\/srv-captain--pos360-frontend(?=\/|$)/i,
-    `https://${host}`
-  );
-  newLoc = newLoc.replace(
-    /^https?:\/\/srv-captain--pos360-edge(?=\/|$)/i,
-    `https://${host}`
-  );
-  newLoc = newLoc.replace(
-    /^https?:\/\/127\.0\.0\.1(?=\/|$)/i,
-    `https://${host}`
-  );
-  newLoc = newLoc.replace(
-    /^https?:\/\/localhost(?=\/|$)/i,
-    `https://${host}`
-  );
+  newLoc = newLoc.replace(/^https?:\/\/srv-captain--pos360-frontend(?=\/|$)/i, `https://${host}`);
+  newLoc = newLoc.replace(/^https?:\/\/srv-captain--pos360-edge(?=\/|$)/i, `https://${host}`);
+  newLoc = newLoc.replace(/^https?:\/\/127\.0\.0\.1(?=\/|$)/i, `https://${host}`);
+  newLoc = newLoc.replace(/^https?:\/\/localhost(?=\/|$)/i, `https://${host}`);
 
   if (isHttps(req)) {
     const hostEsc = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    newLoc = newLoc.replace(
-      new RegExp(`^http:\\/\\/${hostEsc}(?=\\/|$)`, "i"),
-      `https://${host}`
-    );
+    newLoc = newLoc.replace(new RegExp(`^http:\\/\\/${hostEsc}(?=\\/|$)`, "i"), `https://${host}`);
   }
 
   if (newLoc !== loc) proxyRes.headers.location = newLoc;
 }
 
+// ---- Health
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -117,13 +103,19 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ✅ Redirect / -> /shop/
+// ✅ / -> /shop/
 app.get("/", (req, res) => res.redirect(301, "/shop/"));
 
-// ✅ CRÍTICO: redirect SOLO si el path es EXACTAMENTE "/shop" (sin slash final)
-// (Regex evita que Express matchee /shop/ por error)
-app.get(/^\/shop$/, (req, res) => res.redirect(301, "/shop/"));
+// ✅ FIX REAL: redirigir SOLO si el PATH es EXACTAMENTE "/shop"
+// (esto NO depende de strict routing)
+app.use((req, res, next) => {
+  if ((req.method === "GET" || req.method === "HEAD") && req.path === "/shop") {
+    return res.redirect(301, "/shop/");
+  }
+  return next();
+});
 
+// ---- API
 app.use(
   "/api",
   createProxyMiddleware({
@@ -137,6 +129,7 @@ app.use(
   })
 );
 
+// ---- FRONTEND
 app.use(
   "/shop",
   createProxyMiddleware({
