@@ -1,11 +1,12 @@
 /**
- * ✅ pos360-edge/server.js — FINAL
+ * ✅ pos360-edge/server.js — COPY-PASTE FINAL (FIX LOOP /shop/)
  *
  * Routing:
  * - /            -> 301 /shop/
- * - /shop/*      -> FRONTEND
+ * - /shop        -> 301 /shop/
+ * - /shop/*      -> FRONTEND (NO redirects)
  * - /app/*       -> FRONTEND
- * - /api/*       -> API (API_ORIGIN)
+ * - /api/*       -> API (API_ORIGIN)  (API_ORIGIN SIN /api, SIN /v1)
  */
 
 const express = require("express");
@@ -60,11 +61,15 @@ function forceForwardHeaders(proxyReq, req) {
   if (host) proxyReq.setHeader("X-Forwarded-Host", host);
 }
 
+/**
+ * Reescribe Location ABSOLUTO del upstream (srv-captain--pos360-frontend, etc)
+ * a tu dominio público. Si Location es relativo (/shop/), NO se toca.
+ */
 function rewriteLocation(proxyRes, req) {
   const loc = proxyRes.headers?.location;
   if (!loc) return;
 
-  // si es relativo (/shop/), NO tocamos
+  // relativo => NO tocar
   if (String(loc).startsWith("/")) return;
 
   const host = getHost(req);
@@ -72,19 +77,38 @@ function rewriteLocation(proxyRes, req) {
 
   let newLoc = String(loc);
 
-  newLoc = newLoc.replace(/^https?:\/\/srv-captain--pos360-frontend(?=\/|$)/i, `https://${host}`);
-  newLoc = newLoc.replace(/^https?:\/\/srv-captain--pos360-edge(?=\/|$)/i, `https://${host}`);
-  newLoc = newLoc.replace(/^https?:\/\/127\.0\.0\.1(?=\/|$)/i, `https://${host}`);
-  newLoc = newLoc.replace(/^https?:\/\/localhost(?=\/|$)/i, `https://${host}`);
+  newLoc = newLoc.replace(
+    /^https?:\/\/srv-captain--pos360-frontend(?=\/|$)/i,
+    `https://${host}`
+  );
+  newLoc = newLoc.replace(
+    /^https?:\/\/srv-captain--pos360-edge(?=\/|$)/i,
+    `https://${host}`
+  );
+  newLoc = newLoc.replace(
+    /^https?:\/\/127\.0\.0\.1(?=\/|$)/i,
+    `https://${host}`
+  );
+  newLoc = newLoc.replace(
+    /^https?:\/\/localhost(?=\/|$)/i,
+    `https://${host}`
+  );
 
+  // Si el request llega por HTTPS, evitá que Location quede en http://tu-host
   if (isHttps(req)) {
     const hostEsc = host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    newLoc = newLoc.replace(new RegExp(`^http:\\/\\/${hostEsc}(?=\\/|$)`, "i"), `https://${host}`);
+    newLoc = newLoc.replace(
+      new RegExp(`^http:\\/\\/${hostEsc}(?=\\/|$)`, "i"),
+      `https://${host}`
+    );
   }
 
   if (newLoc !== loc) proxyRes.headers.location = newLoc;
 }
 
+// ======================
+// Health
+// ======================
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -101,10 +125,16 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/", (req, res) => {
-  res.status(301).set("Location", "/shop/").send("Moved to /shop/");
-});
+// ======================
+// ✅ Redirects EXACTOS (evita loop /shop/ -> /shop/)
+// ======================
+app.get("/", (req, res) => res.redirect(301, "/shop/"));
+app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 
+// ======================
+// API proxy
+// /api/* -> API_ORIGIN/*
+// ======================
 app.use(
   "/api",
   createProxyMiddleware({
@@ -118,6 +148,11 @@ app.use(
   })
 );
 
+// ======================
+// SHOP proxy
+// /shop/* -> SHOP_UPSTREAM/shop/*
+// (NO redirects acá)
+// ======================
 app.use(
   "/shop",
   createProxyMiddleware({
@@ -130,6 +165,10 @@ app.use(
   })
 );
 
+// ======================
+// APP proxy
+// /app/* -> APP_UPSTREAM/app/*
+// ======================
 app.use(
   "/app",
   createProxyMiddleware({
