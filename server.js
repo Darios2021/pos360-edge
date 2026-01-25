@@ -3,7 +3,7 @@
  *
  * Routing:
  * - /            -> 301 /shop/
- * - /shop        -> 301 /shop/
+ * - /shop        -> 301 /shop/        (SOLO exacto, no /shop/)
  * - /shop/*      -> FRONTEND
  * - /app/*       -> FRONTEND
  * - /api/*       -> API (API_ORIGIN)
@@ -14,9 +14,6 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
 app.set("trust proxy", true);
-
-// ✅ CRÍTICO: hace que "/shop" NO matchee "/shop/"
-app.enable("strict routing");
 
 function env(name, fallback) {
   const v = process.env[name];
@@ -120,9 +117,12 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ✅ Redirects EXACTOS (ahora sí: /shop no agarra /shop/)
+// ✅ Redirect / -> /shop/
 app.get("/", (req, res) => res.redirect(301, "/shop/"));
-app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
+
+// ✅ CRÍTICO: redirect SOLO si el path es EXACTAMENTE "/shop" (sin slash final)
+// (Regex evita que Express matchee /shop/ por error)
+app.get(/^\/shop$/, (req, res) => res.redirect(301, "/shop/"));
 
 app.use(
   "/api",
