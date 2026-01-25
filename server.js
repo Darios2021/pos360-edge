@@ -3,7 +3,7 @@
  *
  * Routing:
  * - /            -> 301 /shop/
- * - /shop        -> 301 /shop/        (exacto por req.path)
+ * - /shop        -> 301 /shop/        (SOLO si req.url === "/shop" o "/shop?...")
  * - /shop/*      -> FRONTEND (proxy)
  * - /app/*       -> FRONTEND (proxy)
  * - /api/*       -> API (API_ORIGIN)
@@ -28,7 +28,7 @@ const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com").replace(/\/+$/, "");
 
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
-const APP_UPSTREAM = env("APP_UPSTREAM", SHOP_UPSTREAM).replace(/\/+$/, "");
+const APP_UPSTREAM  = env("APP_UPSTREAM", SHOP_UPSTREAM).replace(/\/+$/, "");
 
 // ✅ host:puerto (SIN /api, SIN /v1)
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000").replace(/\/+$/, "");
@@ -106,10 +106,13 @@ app.get("/health", (req, res) => {
 // ✅ / -> /shop/
 app.get("/", (req, res) => res.redirect(301, "/shop/"));
 
-// ✅ FIX REAL: redirigir SOLO si el PATH es EXACTAMENTE "/shop"
-// (esto NO depende de strict routing)
+// ✅ FIX DEFINITIVO: redirigir SOLO si el REQUEST es EXACTAMENTE "/shop" (o "/shop?...")
+// OJO: usamos req.url (incluye query) para NO confundir "/shop/".
 app.use((req, res, next) => {
-  if ((req.method === "GET" || req.method === "HEAD") && req.path === "/shop") {
+  if (!(req.method === "GET" || req.method === "HEAD")) return next();
+
+  const u = String(req.url || "");
+  if (u === "/shop" || u.startsWith("/shop?")) {
     return res.redirect(301, "/shop/");
   }
   return next();
