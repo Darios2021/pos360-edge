@@ -1,9 +1,14 @@
 /**
- * ✅ pos360-edge/server.js — FINAL (NO LOOP + MATCH FORTE)
- * - Captura /shop, /shop/, /shop/* con regex (sin depender de strict routing)
- * - Agrega headers para debug: X-EDGE-HIT
- * - /api -> proxy
- * - /app -> proxy
+ * ✅ pos360-edge/server.js — FINAL DEFINITIVO (SHOP STRIP PREFIX)
+ * - /shop/*  -> proxy al frontend, quitando prefijo /shop
+ * - /shop    -> 301 a /shop/
+ * - /        -> 301 a /shop/
+ * - /api/*   -> proxy a API (quitando /api)
+ * - /app/*   -> proxy a admin (quitando /app)
+ *
+ * IMPORTANTÍSIMO:
+ * - Esto fuerza a que el frontend reciba paths como "/", "/product/303", etc.
+ * - Evita loops 301 porque no devuelve /shop/ nunca desde edge.
  */
 
 const express = require("express");
@@ -26,52 +31,54 @@ const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend"
 const APP_UPSTREAM  = env("APP_UPSTREAM", "http://srv-captain--pos360-admin").replace(/\/+$/, "");
 const API_ORIGIN    = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000").replace(/\/+$/, "");
 
-// ===== TRACE =====
+// TRACE
 app.use((req, res, next) => {
-  // esto te deja ver EXACTO qué ruta ve Express
-  console.log("🧭 REQ", req.method, {
-    originalUrl: req.originalUrl,
-    url: req.url,
-    path: req.path,
+  console.log("🧭 REQ", req.method, req.originalUrl, {
     host: req.headers.host,
     xfp: req.headers["x-forwarded-proto"],
   });
   next();
 });
 
-// ===== HEALTH =====
+// Health
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_FINAL_MATCH_FORTE_01"));
+  res.setHeader("X-EDGE-BUILD", env("X_EDGE_BUILD", "EDGE_FINAL_STRIP_SHOP_01"));
   res.json({
     ok: true,
     service: "pos360-edge",
-    build: env("X_EDGE_BUILD", "EDGE_FINAL_MATCH_FORTE_01"),
+    build: env("X_EDGE_BUILD", "EDGE_FINAL_STRIP_SHOP_01"),
     shopUpstream: SHOP_UPSTREAM,
     appUpstream: APP_UPSTREAM,
     apiOrigin: API_ORIGIN,
   });
 });
 
-// ===== PROXIES =====
+// Redirects mínimos
+app.get("/", (req, res) => res.redirect(301, "/shop/"));
+app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 
-// ✅ SHOP: regex captura /shop, /shop/, /shop/loquesea
-const shopProxy = createProxyMiddleware({
-  target: SHOP_UPSTREAM,
-  changeOrigin: true,
-  logLevel: PROXY_LOG_LEVEL,
-  xfwd: true,
-  onProxyRes(proxyRes) {
-    proxyRes.headers["X-EDGE-HIT"] = "shop-proxy";
-  },
-});
+// ✅ SHOP proxy: montar en /shop y STRIP del prefijo
+app.use(
+  "/shop",
+  createProxyMiddleware({
+    target: SHOP_UPSTREAM,
+    changeOrigin: true,
+    logLevel: PROXY_LOG_LEVEL,
+    xfwd: true,
+    // /shop/product/303 => /product/303
+    pathRewrite: (path) => path.replace(/^\/shop/, "") || "/",
+    onProxyRes(proxyRes) {
+      proxyRes.headers["X-EDGE-HIT"] = "shop-proxy";
+    },
+    onError(err, req, res) {
+      console.error("❌ SHOP proxy error", err?.message || err);
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("edge: shop proxy error");
+    },
+  })
+);
 
-// match fuerte
-app.use(/^\/shop(\/|$)/, (req, res, next) => {
-  res.setHeader("X-EDGE-HIT", "shop-entry");
-  return shopProxy(req, res, next);
-});
-
-// ✅ API
+// ✅ API proxy: strip /api
 app.use(
   "/api",
   createProxyMiddleware({
@@ -79,37 +86,32 @@ app.use(
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
-    pathRewrite: { "^/api": "" },
+    pathRewrite: (path) => path.replace(/^\/api/, "") || "/",
     onProxyRes(proxyRes) {
       proxyRes.headers["X-EDGE-HIT"] = "api-proxy";
     },
   })
 );
 
-// ✅ APP
+// ✅ APP proxy: strip /app
 app.use(
-  /^\/app(\/|$)/,
+  "/app",
   createProxyMiddleware({
     target: APP_UPSTREAM,
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
+    pathRewrite: (path) => path.replace(/^\/app/, "") || "/",
     onProxyRes(proxyRes) {
       proxyRes.headers["X-EDGE-HIT"] = "app-proxy";
     },
   })
 );
 
-// ===== ROOT =====
-app.get("/", (req, res) => {
-  res.setHeader("X-EDGE-HIT", "root-redirect");
-  return res.redirect(301, "/shop/");
-});
-
-// ===== FALLBACK =====
+// Fallback
 app.use((req, res) => {
   res.setHeader("X-EDGE-HIT", "edge-404");
   res.status(404).type("text/plain").send("edge: not found");
 });
 
-app.listen(PORT, () => console.log(`✅ pos360-edge FINAL en :${PORT}`));
+app.listen(PORT, () => console.log(`✅ pos360-edge FINAL STRIP en :${PORT}`));
