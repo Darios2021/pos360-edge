@@ -3,15 +3,9 @@
  *
  * Routing:
  * - /            -> 301 -> /shop/
- * - /shop/*      -> FRONTEND (shop)
- * - /app/*       -> FRONTEND (backoffice vive en el mismo frontend)
- * - /api/*       -> API
- *
- * Fixes:
- * - trust proxy => detecta https correctamente
- * - fuerza X-Forwarded-Proto=https cuando corresponde
- * - reescribe Location: http://srv-... -> https://tu-dominio
- * - FIX CLAVE: /shop/* en edge pega contra upstream /shop/* (no contra /)
+ * - /shop/*      -> FRONTEND
+ * - /app/*       -> FRONTEND
+ * - /api/*       -> API (monta /api/v1)
  */
 
 const express = require("express");
@@ -34,7 +28,9 @@ const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com").
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend").replace(/\/+$/, "");
 const APP_UPSTREAM  = env("APP_UPSTREAM",  SHOP_UPSTREAM).replace(/\/+$/, "");
 
-const API_UPSTREAM = env("API_UPSTREAM", "http://srv-captain--pos360-commerce-api:3000/api/v1").replace(/\/+$/, "");
+// ✅ IMPORTANTE: ORIGEN SOLO HOST (SIN /api/v1)
+const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000").replace(/\/+$/, "");
+
 const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
 function firstHeaderValue(v) {
@@ -61,17 +57,14 @@ function rewriteLocationToPublic(proxyRes, req) {
 
   let newLoc = loc;
 
-  // servicios internos -> host público
   newLoc = newLoc.replace(/^http:\/\/srv-captain--pos360-frontend(?=\/|$)/i, `https://${host}`);
   newLoc = newLoc.replace(/^http:\/\/127\.0\.0\.1(?=\/|$)/i, `https://${host}`);
 
-  // upgrade http://host -> https://host
   newLoc = newLoc.replace(
     new RegExp(`^http:\\/\\/${host.replace(/\./g, "\\.")}(?=\\/|$)`, "i"),
     `https://${host}`
   );
 
-  // si el request original fue https, subimos cualquier http://
   if (isHttps(req)) newLoc = newLoc.replace(/^http:\/\//i, "https://");
 
   if (newLoc !== loc) proxyRes.headers["location"] = newLoc;
@@ -85,32 +78,33 @@ app.get("/health", (req, res) => {
     safeMode: false,
     shop: `${SHOP_UPSTREAM}/`,
     app: `${APP_UPSTREAM}/`,
-    api: API_UPSTREAM,
+    apiOrigin: API_ORIGIN,
     publicBase: PUBLIC_BASE_URL,
   });
 });
 
-// ===== Root -> /shop/ (HTTP redirect real) =====
+// ===== Root -> /shop/ =====
 app.get("/", (req, res) => {
   res.redirect(301, "/shop/");
 });
 
-// ===== /api -> API =====
+// ===== /api -> API (/api/v1) =====
+// /api/v1/health (público) => API_ORIGIN + /api/v1/health ✅
+// /api/public/...          => API_ORIGIN + /api/v1/public/... ✅
 app.use(
   "/api",
   createProxyMiddleware({
-    target: API_UPSTREAM,
+    target: API_ORIGIN,
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
     onProxyReq: forceForwardProto,
     onProxyRes: rewriteLocationToPublic,
-    pathRewrite: (path) => path.replace(/^\/api/, ""),
+    pathRewrite: (path) => `/api/v1${path.replace(/^\/api/, "")}`,
   })
 );
 
 // ===== /shop -> FRONTEND =====
-// FIX: upstream vive en /shop, entonces /shop/* => /shop/* (no /)
 app.use(
   "/shop",
   createProxyMiddleware({
@@ -120,13 +114,11 @@ app.use(
     xfwd: true,
     onProxyReq: forceForwardProto,
     onProxyRes: rewriteLocationToPublic,
-    pathRewrite: (path) => `/shop${path}`, // ✅ CLAVE
+    pathRewrite: (path) => `/shop${path}`,
   })
 );
 
-// ===== /app -> FRONTEND (backoffice en el mismo frontend) =====
-// Si tu backoffice vive bajo /app en el frontend: /app/* => /app/*
-// Si en realidad vive en /app dentro del build del frontend, esto queda OK.
+// ===== /app -> FRONTEND =====
 app.use(
   "/app",
   createProxyMiddleware({
@@ -136,8 +128,6 @@ app.use(
     xfwd: true,
     onProxyReq: forceForwardProto,
     onProxyRes: rewriteLocationToPublic,
-    // si tu backoffice realmente está montado en otra ruta interna, reescribí acá:
-    // pathRewrite: (path) => path.replace(/^\/app/, "/shop/app")
   })
 );
 
@@ -145,6 +135,6 @@ app.listen(PORT, () => {
   console.log(`✅ pos360-edge on :${PORT}`);
   console.log(`shop -> ${SHOP_UPSTREAM}/shop/`);
   console.log(`app  -> ${APP_UPSTREAM}/app/`);
-  console.log(`api  -> ${API_UPSTREAM}`);
+  console.log(`api  -> ${API_ORIGIN}/api/v1/*`);
   console.log(`public -> ${PUBLIC_BASE_URL}`);
 });
