@@ -1,6 +1,10 @@
 /**
  * ✅ pos360-edge/server.js
- * ✅ COPY-PASTE FINAL DEFINITIVO (ESTABLE + FIX ASSETS + FIX APIv1 + FIX /app mapeado a /shop/app)
+ * ✅ COPY-PASTE FINAL DEFINITIVO (ESTABLE + FIX ASSETS + FIX APIv1 + FIX /app dentro del mismo frontend)
+ *
+ * CLAVE:
+ * - Evitar que CapRover mate el contenedor por healthcheck:
+ *   - "/" responde 200 para checks (y redirige solo si parece navegador)
  */
 
 const express = require("express");
@@ -26,7 +30,6 @@ function env(name, fallback) {
 }
 
 function safePath(p) {
-  // http-proxy-middleware puede pasar algo raro en edge-cases
   if (typeof p !== "string") return "/";
   const s = p.trim();
   return s ? s : "/";
@@ -51,17 +54,15 @@ const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
 // Upstreams
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend");
-const APP_UPSTREAM = env("APP_UPSTREAM", "http://srv-captain--pos360-frontend"); // en tu caso coexiste ahí
+const APP_UPSTREAM = env("APP_UPSTREAM", "http://srv-captain--pos360-frontend"); // coexiste ahí
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000");
 const API_BASE = env("API_BASE", "/api/v1");
 
-// Base pública (debug)
+// Debug
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com");
 
-// Dónde vive el frontend (build base)
+// Frontend base
 const FRONTEND_INDEX_PATH = env("FRONTEND_INDEX_PATH", "/shop/");
-
-// Backoffice dentro del mismo build
 const APP_INDEX_PATH = env("APP_INDEX_PATH", "/shop/app/");
 
 // ====================
@@ -71,10 +72,10 @@ app.disable("x-powered-by");
 app.enable("strict routing");
 
 // ====================
-// Health
+// Health real
 // ====================
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_HARDENED_01");
+  res.setHeader("X-EDGE-BUILD", "EDGE_HARDENED_02_CAPROVER_HEALTHFIX_01");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -108,35 +109,27 @@ function makeProxy(target, opts = {}) {
         target,
         err && err.stack ? err.stack : err
       );
-
       if (res.headersSent) return;
-      res.status(502);
-      res.setHeader("Content-Type", "application/json; charset=utf-8");
-      res.setHeader("X-EDGE-PROXY-ERROR", "1");
-      res.end(
-        JSON.stringify({
-          ok: false,
-          error: "Bad Gateway",
-          path: req.originalUrl,
-          target,
-          message: String(err && err.message ? err.message : err),
-        })
-      );
+      res.status(502).json({
+        ok: false,
+        error: "Bad Gateway",
+        path: req.originalUrl,
+        target,
+        message: String(err && err.message ? err.message : err),
+      });
     },
   });
 }
 
 /**
- * ✅ 1) SHOP ASSETS FIRST
- * /shop/assets/* (mount) => llega "/index-xxx.js"
- * upstream necesita "/assets/index-xxx.js"
+ * ✅ 1) /shop/assets/* -> /assets/*
  */
 const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
 });
 
 /**
- * ✅ 2) SHOP proxy general (PRESERVA /shop)
+ * ✅ 2) /shop/* -> preservar /shop
  */
 const shopProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (p) => joinPrefix(FRONTEND_INDEX_PATH, p),
@@ -155,12 +148,12 @@ const rootAssetsProxy = makeProxy(SHOP_UPSTREAM, {
 const rootStaticProxy = makeProxy(SHOP_UPSTREAM);
 
 /**
- * ✅ API: /api/* -> /api/v1/*
+ * ✅ /api/* -> /api/v1/*
  */
 const apiProxy = makeProxy(API_ORIGIN, {
   pathRewrite: (p) => {
     const path = ensureSlashStart(p);
-    const base = ensureSlashStart(API_BASE); // "/api/v1"
+    const base = ensureSlashStart(API_BASE);
     if (path.startsWith(base)) return path;
     return `${removeTrailingSlash(base)}${path}`;
   },
@@ -177,19 +170,28 @@ const apiV1CompatProxy = makeProxy(API_ORIGIN);
 const publicCompatProxy = makeProxy(API_ORIGIN);
 
 /**
- * ✅ APP: /app/* -> /shop/app/*
- * (porque el build está en base /shop/)
+ * ✅ /app/* -> /shop/app/*
  */
 const appProxy = makeProxy(APP_UPSTREAM, {
   pathRewrite: (p) => joinPrefix(APP_INDEX_PATH, p),
 });
 
 // ====================
-// Redirects base
+// 🔥 FIX CAPROVER: "/" devuelve 200 (y solo redirige si es browser)
 // ====================
-app.get("/", (req, res) =>
-  res.redirect(301, removeTrailingSlash(FRONTEND_INDEX_PATH) + "/")
-);
+app.get("/", (req, res) => {
+  const accept = String(req.headers.accept || "");
+  const ua = String(req.headers["user-agent"] || "");
+  const looksLikeBrowser = accept.includes("text/html") || ua.includes("Mozilla");
+
+  if (looksLikeBrowser) {
+    return res.redirect(302, removeTrailingSlash(FRONTEND_INDEX_PATH) + "/");
+  }
+
+  // para health checks / curl / caprover
+  res.status(200).send("OK");
+});
+
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 app.get("/app", (req, res) => res.redirect(301, "/app/"));
 
