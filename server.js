@@ -1,17 +1,18 @@
 /**
  * ✅ pos360-edge/server.js
- * ✅ COPY-PASTE FINAL DEFINITIVO
+ * ✅ COPY-PASTE FINAL DEFINITIVO (OG real para productos + og-default.png 1200x630)
  *
  * Qué corrige:
  * - OG placeholders "__OG_TITLE__" etc: el EDGE los reemplaza para BOTS (Facebook/WhatsApp/Twitter/Telegram/Discord)
  * - Warning de Facebook: inyecta fb:app_id si hay FB_APP_ID
  * - Bug de assets: si el HTML viene con "/app/assets/" lo reescribe a "/shop/assets/" para rutas /shop/*
- * - Mantiene tus proxys existentes: /shop, /shop/assets, /assets, /api, /api/v1, /public, /app (transparente a /shop/app)
- * - ✅ FIX OG IMAGE: /og-default.png SIEMPRE responde image/png y tamaño >= 200x200 (genera 1200x630 si no hay archivo)
+ * - Mantiene proxys: /shop, /shop/assets, /assets, /api, /api/v1, /public, /app (transparente a /shop/app)
+ * - ✅ og-default.png: SIEMPRE 200 image/png y tamaño OG recomendado 1200x630 (no “demasiado pequeña”)
+ * - ✅ OG de producto real: para /shop/product/:id consulta API pública y setea og:title/description/image reales
  *
- * Resultado:
- * - Facebook debugger deja de ver __OG_TITLE__ y te muestra OG reales (por lo menos default)
- * - og:image ahora apunta a una URL que EXISTE, devuelve image/png, y NO es “demasiado pequeña”
+ * Recomendado en ENV:
+ * - FB_APP_ID=xxxx (opcional)
+ * - OG_BRANCH_ID=3 (si tu API pública usa branch_id)
  */
 
 const express = require("express");
@@ -60,7 +61,7 @@ const PUBLIC_BASE_URL = removeTrailingSlash(
 const FRONTEND_INDEX_PATH = env("FRONTEND_INDEX_PATH", "/shop/");
 const APP_INDEX_PATH = env("APP_INDEX_PATH", "/shop/app/");
 
-// OG defaults (mínimo)
+// OG defaults
 const OG_SITE_NAME = env("OG_SITE_NAME", "San Juan Tecnología");
 const OG_TITLE_DEFAULT = env("OG_TITLE_DEFAULT", "San Juan Tecnología | Tienda");
 const OG_DESCRIPTION_DEFAULT = env(
@@ -68,10 +69,12 @@ const OG_DESCRIPTION_DEFAULT = env(
   "Electrónica, ecommerce, sistemas POS y soluciones tecnológicas para empresas."
 );
 const OG_IMAGE_DEFAULT = env("OG_IMAGE_DEFAULT", `${PUBLIC_BASE_URL}/og-default.png`);
-const FB_APP_ID = env("FB_APP_ID", ""); // opcional: si lo ponés, desaparece el warning
+const FB_APP_ID = env("FB_APP_ID", "");
 
-// ✅ Ruta local del PNG (si la tenés, se usa)
-// pos360-edge/public/og-default.png
+// Branch (si aplica a tu API pública)
+const OG_BRANCH_ID = env("OG_BRANCH_ID", "3");
+
+// ✅ Ruta local del PNG opcional (si existiera, se usa)
 const OG_DEFAULT_FILE = path.join(__dirname, "public", "og-default.png");
 
 // ====== Core settings ======
@@ -80,7 +83,7 @@ app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_OG_INJECT_BOTS_ASSETFIX_03_OGPNG_1200x630");
+  res.setHeader("X-EDGE-BUILD", "EDGE_OG_PRODUCTS_01_OGPNG_1200x630");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -121,12 +124,11 @@ function pngChunk(type, data) {
 function createSolidPng(width, height, rgba = [245, 245, 245, 255]) {
   const [r, g, b, a] = rgba;
 
-  // Raw scanlines: each row starts with filter byte 0, then RGBA pixels
   const rowLen = 1 + width * 4;
   const raw = Buffer.alloc(rowLen * height);
 
   const row = Buffer.alloc(rowLen);
-  row[0] = 0; // filter type 0
+  row[0] = 0; // filter 0
   for (let x = 0; x < width; x++) {
     const o = 1 + x * 4;
     row[o] = r;
@@ -143,11 +145,11 @@ function createSolidPng(width, height, rgba = [245, 245, 245, 255]) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
   ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
+  ihdr[8] = 8;
   ihdr[9] = 6; // RGBA
-  ihdr[10] = 0; // compression
-  ihdr[11] = 0; // filter
-  ihdr[12] = 0; // interlace
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
 
   return Buffer.concat([
     sig,
@@ -157,16 +159,11 @@ function createSolidPng(width, height, rgba = [245, 245, 245, 255]) {
   ]);
 }
 
-// ✅ buffer generado 1200x630 (cumple mínimo 200x200 y formato OG recomendado)
 const OG_DEFAULT_PNG_BUFFER = createSolidPng(1200, 630, [245, 245, 245, 255]);
 
-// ====== ✅ OG DEFAULT PNG (ANTES DE TODO) ======
-// - Si existe public/og-default.png => lo sirve
-// - Si NO existe => intenta upstream
-// - Si no hay upstream => genera 1200x630 (NO “demasiado pequeña”)
+// ====== ✅ og-default.png ======
 app.get("/og-default.png", async (req, res) => {
   try {
-    // 1) archivo local
     if (fs.existsSync(OG_DEFAULT_FILE)) {
       res.setHeader("Content-Type", "image/png");
       res.setHeader("Cache-Control", "public, max-age=86400");
@@ -174,7 +171,6 @@ app.get("/og-default.png", async (req, res) => {
       return res.sendFile(OG_DEFAULT_FILE);
     }
 
-    // 2) upstream (si el FE lo tiene)
     const upstreamUrl = `${removeTrailingSlash(SHOP_UPSTREAM)}/og-default.png`;
     try {
       const controller = new AbortController();
@@ -193,11 +189,8 @@ app.get("/og-default.png", async (req, res) => {
         res.setHeader("X-EDGE-HIT", "og-default-upstream");
         return res.send(buf);
       }
-    } catch (_) {
-      // ignore y caemos al generado
-    }
+    } catch (_) {}
 
-    // 3) generado 1200x630
     res.status(200);
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "public, max-age=86400");
@@ -222,7 +215,6 @@ function makeProxy(target, opts = {}) {
     secure: false,
     ...opts,
     onProxyReq(proxyReq, req, res) {
-      // ✅ Importante: preserva Host público para que el upstream no genere URLs raras
       proxyReq.setHeader("Host", req.headers.host || "");
       if (opts.onProxyReq) opts.onProxyReq(proxyReq, req, res);
     },
@@ -244,7 +236,7 @@ function makeProxy(target, opts = {}) {
   });
 }
 
-// ====== BOT detection + HTML injector ======
+// ====== Bot detect + HTML injector ======
 function isBot(req) {
   const ua = String(req.headers["user-agent"] || "").toLowerCase();
   if (!ua) return false;
@@ -282,22 +274,169 @@ function injectFbAppId(html) {
   return html.replace("</head>", `${meta}</head>`);
 }
 
-function replaceTokens(html, req) {
+function absolutizeUrl(u) {
+  if (!u) return "";
+  const s = String(u).trim();
+  if (!s) return "";
+  if (s.startsWith("http://") || s.startsWith("https://")) return s;
+  if (s.startsWith("//")) return `https:${s}`;
+  return `${PUBLIC_BASE_URL}${s.startsWith("/") ? "" : "/"}${s}`;
+}
+
+function pickFirstImage(obj) {
+  if (!obj) return "";
+  const candidates = [
+    obj.og_image,
+    obj.image,
+    obj.image_url,
+    obj.imageUrl,
+    obj.cover,
+    obj.cover_url,
+    obj.thumbnail,
+    obj.thumbnail_url,
+    obj.photo,
+    obj.photo_url,
+    obj.main_image,
+    obj.main_image_url,
+  ];
+  for (const c of candidates) {
+    if (c && String(c).trim()) return String(c).trim();
+  }
+  const imgs = obj.images || obj.gallery || obj.pictures;
+  if (Array.isArray(imgs) && imgs.length) {
+    const first = imgs[0];
+    if (typeof first === "string") return first;
+    if (first && typeof first === "object") {
+      return (
+        first.url ||
+        first.secure_url ||
+        first.src ||
+        first.path ||
+        first.location ||
+        first.public_url ||
+        ""
+      );
+    }
+  }
+  return "";
+}
+
+async function fetchJson(url, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    const ct = String(resp.headers.get("content-type") || "").toLowerCase();
+    const text = await resp.text();
+    if (!resp.ok) return { ok: false, status: resp.status, ct, data: null, text };
+    let data = null;
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      return { ok: false, status: resp.status, ct, data: null, text };
+    }
+    return { ok: true, status: resp.status, ct, data, text };
+  } catch (e) {
+    return { ok: false, status: 0, ct: "", data: null, text: "" };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function fetchProductOg(productId) {
+  const id = String(productId || "").trim();
+  if (!id) return null;
+
+  const base = removeTrailingSlash(API_ORIGIN) + ensureSlashStart(API_BASE);
+  const branch = encodeURIComponent(OG_BRANCH_ID);
+
+  // Probamos varias rutas típicas para “producto público”
+  const tries = [
+    `${base}/public/products/${encodeURIComponent(id)}?branch_id=${branch}`,
+    `${base}/public/product/${encodeURIComponent(id)}?branch_id=${branch}`,
+    `${base}/public/products/${encodeURIComponent(id)}`,
+    `${base}/public/product/${encodeURIComponent(id)}`,
+    `${base}/public/catalog?branch_id=${branch}&product_id=${encodeURIComponent(id)}&page=1&limit=1`,
+    `${base}/public/catalog?branch_id=${branch}&id=${encodeURIComponent(id)}&page=1&limit=1`,
+  ];
+
+  for (const url of tries) {
+    const r = await fetchJson(url, 5000);
+    if (!r.ok || !r.data) continue;
+
+    // Normalizamos: a veces devuelve {ok:true, item:{...}} o {ok:true, items:[...]}
+    const d = r.data;
+
+    let item =
+      d.item ||
+      d.product ||
+      (Array.isArray(d.items) && d.items[0]) ||
+      (Array.isArray(d.data) && d.data[0]) ||
+      d;
+
+    if (!item || typeof item !== "object") continue;
+
+    const name =
+      item.name ||
+      item.title ||
+      item.product_name ||
+      item.productTitle ||
+      item.nombre ||
+      "";
+
+    const description =
+      item.description ||
+      item.desc ||
+      item.short_description ||
+      item.shortDescription ||
+      item.descripcion ||
+      "";
+
+    const img = pickFirstImage(item);
+    const image = img ? absolutizeUrl(img) : "";
+
+    // Si no hay nombre, no sirve
+    const safeName = String(name || "").trim();
+    if (!safeName) continue;
+
+    const title = `${safeName} | ${OG_SITE_NAME}`;
+    const desc = String(description || "").trim() || OG_DESCRIPTION_DEFAULT;
+
+    return {
+      ogTitle: title,
+      ogDescription: desc,
+      ogImage: image || OG_IMAGE_DEFAULT,
+    };
+  }
+
+  return null;
+}
+
+function replaceTokens(html, req, overrides = null) {
   const fullUrl = `${PUBLIC_BASE_URL}${req.originalUrl}`;
   const canonical = fullUrl;
 
+  const ogTitle = overrides?.ogTitle || OG_TITLE_DEFAULT;
+  const ogDescription = overrides?.ogDescription || OG_DESCRIPTION_DEFAULT;
+  const ogImage = overrides?.ogImage || OG_IMAGE_DEFAULT;
+
   let out = html
-    .replaceAll("__TITLE__", OG_TITLE_DEFAULT)
-    .replaceAll("__DESCRIPTION__", OG_DESCRIPTION_DEFAULT)
+    .replaceAll("__TITLE__", ogTitle)
+    .replaceAll("__DESCRIPTION__", ogDescription)
     .replaceAll("__CANONICAL__", canonical)
 
     .replaceAll("__SITE_NAME__", OG_SITE_NAME)
-    .replaceAll("__OG_TITLE__", OG_TITLE_DEFAULT)
-    .replaceAll("__OG_DESCRIPTION__", OG_DESCRIPTION_DEFAULT)
+    .replaceAll("__OG_TITLE__", ogTitle)
+    .replaceAll("__OG_DESCRIPTION__", ogDescription)
     .replaceAll("__OG_URL__", fullUrl)
-    .replaceAll("__OG_IMAGE__", OG_IMAGE_DEFAULT)
-    .replaceAll("__OG_IMAGE_ALT__", OG_TITLE_DEFAULT);
+    .replaceAll("__OG_IMAGE__", ogImage)
+    .replaceAll("__OG_IMAGE_ALT__", ogTitle);
 
+  // Fix assets mismatch: si el HTML vino con /app/assets para una URL /shop/*
   if (req.originalUrl.startsWith("/shop/")) {
     out = out
       .replaceAll('src="/app/assets/', 'src="/shop/assets/')
@@ -327,12 +466,20 @@ async function fetchUpstreamHtml(pathname) {
   return { status: resp.status, contentType: ct, body: text };
 }
 
+function matchProductId(pathname) {
+  // /shop/product/303  (y variantes con / al final)
+  const m = String(pathname || "").match(/^\/shop\/product\/(\d+)(\/|$)/i);
+  return m ? m[1] : null;
+}
+
+// Middleware que solo aplica a BOTS para /shop/*
 async function botOgMiddleware(req, res, next) {
   try {
     if (req.method !== "GET" && req.method !== "HEAD") return next();
     if (!isBot(req)) return next();
     if (!wantsHtml(req)) return next();
 
+    // Ignorar assets/api/etc
     if (
       req.originalUrl.startsWith("/shop/assets/") ||
       req.originalUrl.startsWith("/assets/") ||
@@ -344,6 +491,7 @@ async function botOgMiddleware(req, res, next) {
       return next();
     }
 
+    // HTML real del upstream
     const upstreamPath = joinPrefix(FRONTEND_INDEX_PATH, req.path);
     const { status, contentType, body } = await fetchUpstreamHtml(upstreamPath);
 
@@ -352,14 +500,18 @@ async function botOgMiddleware(req, res, next) {
       return;
     }
 
-    const patched = replaceTokens(body, req);
+    // ✅ Si es producto, buscamos OG real en API
+    const pid = matchProductId(req.originalUrl);
+    const og = pid ? await fetchProductOg(pid) : null;
+
+    const patched = replaceTokens(body, req, og);
 
     res.status(status);
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
-    res.setHeader("X-EDGE-HIT", "bot-og-inject");
+    res.setHeader("X-EDGE-HIT", og ? "bot-og-product" : "bot-og-default");
     res.send(patched);
   } catch (e) {
     console.error("❌ botOgMiddleware error:", e && e.message ? e.message : e);
@@ -442,5 +594,6 @@ app.listen(PORT, () => {
   console.log(`FRONTEND_INDEX_PATH -> ${FRONTEND_INDEX_PATH}`);
   console.log(`APP_INDEX_PATH -> ${APP_INDEX_PATH}`);
   console.log(`FB_APP_ID -> ${FB_APP_ID ? "SET" : "NOT_SET"}`);
+  console.log(`OG_BRANCH_ID -> ${OG_BRANCH_ID}`);
   console.log(`OG_DEFAULT_FILE -> ${OG_DEFAULT_FILE}`);
 });
