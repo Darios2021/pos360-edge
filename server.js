@@ -1,18 +1,17 @@
 /**
  * ✅ pos360-edge/server.js
- * ✅ COPY-PASTE FINAL DEFINITIVO (OG real para productos + og-default.png 1200x630)
+ * ✅ COPY-PASTE FINAL DEFINITIVO (OG real + cache-busting por version)
  *
  * Qué corrige:
  * - OG placeholders "__OG_TITLE__" etc: el EDGE los reemplaza para BOTS (Facebook/WhatsApp/Twitter/Telegram/Discord)
  * - Warning de Facebook: inyecta fb:app_id si hay FB_APP_ID
  * - Bug de assets: si el HTML viene con "/app/assets/" lo reescribe a "/shop/assets/" para rutas /shop/*
  * - Mantiene proxys: /shop, /shop/assets, /assets, /api, /api/v1, /public, /app (transparente a /shop/app)
- * - ✅ og-default.png: SIEMPRE 200 image/png y tamaño OG recomendado 1200x630 (no “demasiado pequeña”)
+ * - ✅ og-default.png: SIEMPRE 200 image/png y tamaño OG recomendado 1200x630
  * - ✅ OG de producto real: para /shop/product/:id consulta API pública y setea og:title/description/image reales
- *
- * Recomendado en ENV:
- * - FB_APP_ID=xxxx (opcional)
- * - OG_BRANCH_ID=3 (si tu API pública usa branch_id)
+ * - ✅ Nivel 3 (pro): og:image con cache-busting estable: agrega ?v=<version> sacado del filename/timestamp
+ *   Ej: .../1767045077180-fbd7623a.webp?v=1767045077180
+ * - ✅ branch_id: respeta ?branch_id=3 en la URL del producto para buscar datos correctos
  */
 
 const express = require("express");
@@ -71,7 +70,7 @@ const OG_DESCRIPTION_DEFAULT = env(
 const OG_IMAGE_DEFAULT = env("OG_IMAGE_DEFAULT", `${PUBLIC_BASE_URL}/og-default.png`);
 const FB_APP_ID = env("FB_APP_ID", "");
 
-// Branch (si aplica a tu API pública)
+// Branch default (si no viene en query)
 const OG_BRANCH_ID = env("OG_BRANCH_ID", "3");
 
 // ✅ Ruta local del PNG opcional (si existiera, se usa)
@@ -83,7 +82,7 @@ app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_OG_PRODUCTS_01_OGPNG_1200x630");
+  res.setHeader("X-EDGE-BUILD", "EDGE_OG_PRODUCTS_VERSIONED_02");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -321,6 +320,30 @@ function pickFirstImage(obj) {
   return "";
 }
 
+/**
+ * ✅ Extrae una "version" estable para cache-busting desde la URL de imagen.
+ * Casos típicos:
+ * - .../1767045077180-fbd7623a.webp  => v=1767045077180
+ * - .../111/1769444359050-xxxx.webp  => v=1769444359050
+ * Si no encuentra timestamp: usa fallback "p<id>-b<branch>"
+ */
+function deriveImageVersion(imageUrl, productId, branchId) {
+  const u = String(imageUrl || "");
+  const m = u.match(/\/(\d{10,})-[^\/]+\.(webp|jpg|jpeg|png)(\?.*)?$/i);
+  if (m && m[1]) return m[1];
+  const m2 = u.match(/\/(\d{10,})\.(webp|jpg|jpeg|png)(\?.*)?$/i);
+  if (m2 && m2[1]) return m2[1];
+  return `p${String(productId || "").trim() || "x"}-b${String(branchId || "").trim() || "x"}`;
+}
+
+function addVersionParam(url, version) {
+  if (!url) return url;
+  const s = String(url);
+  if (!version) return s;
+  if (/[?&]v=/.test(s)) return s; // ya tiene v=
+  return s.includes("?") ? `${s}&v=${encodeURIComponent(version)}` : `${s}?v=${encodeURIComponent(version)}`;
+}
+
 async function fetchJson(url, timeoutMs = 5000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -330,31 +353,30 @@ async function fetchJson(url, timeoutMs = 5000) {
       headers: { Accept: "application/json" },
       signal: controller.signal,
     });
-    const ct = String(resp.headers.get("content-type") || "").toLowerCase();
     const text = await resp.text();
-    if (!resp.ok) return { ok: false, status: resp.status, ct, data: null, text };
+    if (!resp.ok) return { ok: false, status: resp.status, data: null, text };
     let data = null;
     try {
       data = JSON.parse(text);
     } catch (_) {
-      return { ok: false, status: resp.status, ct, data: null, text };
+      return { ok: false, status: resp.status, data: null, text };
     }
-    return { ok: true, status: resp.status, ct, data, text };
+    return { ok: true, status: resp.status, data, text };
   } catch (e) {
-    return { ok: false, status: 0, ct: "", data: null, text: "" };
+    return { ok: false, status: 0, data: null, text: "" };
   } finally {
     clearTimeout(t);
   }
 }
 
-async function fetchProductOg(productId) {
+async function fetchProductOg(productId, branchId) {
   const id = String(productId || "").trim();
+  const br = String(branchId || "").trim() || OG_BRANCH_ID;
   if (!id) return null;
 
   const base = removeTrailingSlash(API_ORIGIN) + ensureSlashStart(API_BASE);
-  const branch = encodeURIComponent(OG_BRANCH_ID);
+  const branch = encodeURIComponent(br);
 
-  // Probamos varias rutas típicas para “producto público”
   const tries = [
     `${base}/public/products/${encodeURIComponent(id)}?branch_id=${branch}`,
     `${base}/public/product/${encodeURIComponent(id)}?branch_id=${branch}`,
@@ -368,9 +390,7 @@ async function fetchProductOg(productId) {
     const r = await fetchJson(url, 5000);
     if (!r.ok || !r.data) continue;
 
-    // Normalizamos: a veces devuelve {ok:true, item:{...}} o {ok:true, items:[...]}
     const d = r.data;
-
     let item =
       d.item ||
       d.product ||
@@ -397,19 +417,23 @@ async function fetchProductOg(productId) {
       "";
 
     const img = pickFirstImage(item);
-    const image = img ? absolutizeUrl(img) : "";
+    const imageAbs = img ? absolutizeUrl(img) : "";
 
-    // Si no hay nombre, no sirve
     const safeName = String(name || "").trim();
     if (!safeName) continue;
 
     const title = `${safeName} | ${OG_SITE_NAME}`;
     const desc = String(description || "").trim() || OG_DESCRIPTION_DEFAULT;
 
+    // ✅ Versionado de imagen (Nivel 3)
+    const baseImg = imageAbs || OG_IMAGE_DEFAULT;
+    const v = deriveImageVersion(baseImg, id, br);
+    const versionedImage = addVersionParam(baseImg, v);
+
     return {
       ogTitle: title,
       ogDescription: desc,
-      ogImage: image || OG_IMAGE_DEFAULT,
+      ogImage: versionedImage,
     };
   }
 
@@ -436,7 +460,6 @@ function replaceTokens(html, req, overrides = null) {
     .replaceAll("__OG_IMAGE__", ogImage)
     .replaceAll("__OG_IMAGE_ALT__", ogTitle);
 
-  // Fix assets mismatch: si el HTML vino con /app/assets para una URL /shop/*
   if (req.originalUrl.startsWith("/shop/")) {
     out = out
       .replaceAll('src="/app/assets/', 'src="/shop/assets/')
@@ -467,8 +490,7 @@ async function fetchUpstreamHtml(pathname) {
 }
 
 function matchProductId(pathname) {
-  // /shop/product/303  (y variantes con / al final)
-  const m = String(pathname || "").match(/^\/shop\/product\/(\d+)(\/|$)/i);
+  const m = String(pathname || "").match(/^\/shop\/product\/(\d+)(\/|$|\?)/i);
   return m ? m[1] : null;
 }
 
@@ -479,7 +501,6 @@ async function botOgMiddleware(req, res, next) {
     if (!isBot(req)) return next();
     if (!wantsHtml(req)) return next();
 
-    // Ignorar assets/api/etc
     if (
       req.originalUrl.startsWith("/shop/assets/") ||
       req.originalUrl.startsWith("/assets/") ||
@@ -491,7 +512,6 @@ async function botOgMiddleware(req, res, next) {
       return next();
     }
 
-    // HTML real del upstream
     const upstreamPath = joinPrefix(FRONTEND_INDEX_PATH, req.path);
     const { status, contentType, body } = await fetchUpstreamHtml(upstreamPath);
 
@@ -500,9 +520,10 @@ async function botOgMiddleware(req, res, next) {
       return;
     }
 
-    // ✅ Si es producto, buscamos OG real en API
+    // ✅ Si es producto, buscamos OG real con branch_id de la URL
     const pid = matchProductId(req.originalUrl);
-    const og = pid ? await fetchProductOg(pid) : null;
+    const branchId = (req.query && req.query.branch_id ? String(req.query.branch_id) : "") || OG_BRANCH_ID;
+    const og = pid ? await fetchProductOg(pid, branchId) : null;
 
     const patched = replaceTokens(body, req, og);
 
@@ -520,7 +541,6 @@ async function botOgMiddleware(req, res, next) {
 }
 
 // ====== Proxys ======
-
 const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
 });
