@@ -1,19 +1,22 @@
 /**
  * ✅ pos360-edge/server.js
- * ✅ COPY-PASTE FINAL DEFINITIVO (FIX BLANK PAGE + strict MIME)
+ * ✅ COPY-PASTE FINAL DEFINITIVO (FIX ASSETS 404 + /shop + compat /assets)
  *
- * Contexto:
- * - Tu index.html sale con <script src="/shop/assets/index-xxx.js">
- * - Pero los archivos reales están en /assets/* dentro del contenedor (dist/assets)
- * - Entonces: /shop/assets/* debe mapearse a /assets/*
+ * FIX CLAVE:
+ * - Vite genera <script src="/shop/assets/..."> y <link href="/shop/assets/...">
+ * - Si /shop/assets cae en el handler HTML/branding o en rewrite errado -> 404 y pantalla blanca
+ * - Solución: PROXY DIRECTO para /shop/assets/* ANTES del proxy general /shop/
  *
- * Estrategia:
- * - /shop/assets/*  -> proxy a FRONT /assets/*
- * - /shop/*         -> proxy a FRONT /*   (strip /shop)
- * - /assets/*       -> compat -> FRONT /assets/*
- * - /favicon.ico y /shop/favicon.ico -> FRONT /favicon.ico
- * - /api/*          -> API
- * - /app/*          -> APP
+ * Rutas:
+ *  - /health        -> 200
+ *  - /              -> 301 /shop/
+ *  - /shop          -> 301 /shop/
+ *  - /shop/assets/* -> proxy a frontend como /assets/*
+ *  - /shop/*        -> proxy a frontend PRESERVANDO /shop (reinyecta prefijo)
+ *  - /assets/*      -> (compat) proxy a frontend como /assets/*
+ *  - /favicon.ico   -> (compat) proxy a frontend como /favicon.ico
+ *  - /api/*         -> proxy a API
+ *  - /app/*         -> proxy a APP (si aplica)
  */
 
 const express = require("express");
@@ -32,9 +35,16 @@ function ensureSlashStart(p) {
   if (!p) return "/";
   return p.startsWith("/") ? p : `/${p}`;
 }
-
 function removeTrailingSlash(p) {
   return p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p;
+}
+function joinPrefix(prefix, path) {
+  // prefix: "/shop/" o "/shop"
+  // path: "/product/303" o "/"
+  const pfx = removeTrailingSlash(ensureSlashStart(prefix));
+  const pth = ensureSlashStart(path);
+  if (pth === "/") return `${pfx}/`;
+  return `${pfx}${pth}`;
 }
 
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
@@ -44,18 +54,22 @@ const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend");
 const APP_UPSTREAM = env("APP_UPSTREAM", "http://srv-captain--pos360-admin");
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000");
-const API_BASE = env("API_BASE", "/api/v1");
+const API_BASE = env("API_BASE", "/api/v1"); // default
 
-// Base pública (solo debug)
+// Base pública (no se usa en routing, queda para logs/debug)
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com");
 
-// ====== Core ======
+// Donde vive el frontend
+const FRONTEND_INDEX_PATH = env("FRONTEND_INDEX_PATH", "/shop/"); // "/shop/"
+
+// ====== Core settings ======
 app.disable("x-powered-by");
+// evita equivalencia /shop y /shop/
 app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_STRIP_SHOP_ASSETS_01");
+  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_ASSETS_FIRST_01");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -65,16 +79,17 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ====== Proxy helper ======
+// ====== Helpers: proxy builder ======
 function makeProxy(target, opts = {}) {
   return createProxyMiddleware({
     target,
     changeOrigin: true,
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
-    secure: false,
+    secure: false, // targets internos http
     ...opts,
     onProxyReq(proxyReq, req, res) {
+      // Host real (útil para apps que generan URLs)
       proxyReq.setHeader("Host", req.headers.host || "");
       if (opts.onProxyReq) opts.onProxyReq(proxyReq, req, res);
     },
@@ -82,30 +97,33 @@ function makeProxy(target, opts = {}) {
 }
 
 /**
- * ✅ FRONT ASSETS: /shop/assets/* -> /assets/*
- * (lo que evita strict MIME)
+ * ✅ 1) SHOP ASSETS FIRST
+ * /shop/assets/...  ->  /assets/...
+ * (Esto es LO que te estaba rompiendo la pantalla blanca)
  */
-const shopAssetsProxy = makeProxy(SHOP_UPSTREAM, {
-  pathRewrite: (path) => path.replace(/^\/shop\/assets\//, "/assets/"),
+const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
+  pathRewrite: (path) => path.replace(/^\/shop/, ""), // "/shop/assets/x" -> "/assets/x"
 });
 
 /**
- * ✅ FRONT general: /shop/* -> /*
- * (strip /shop para que el contenedor sirva dist como root)
+ * ✅ 2) SHOP proxy general (PRESERVA /shop)
+ * Express al montar "/shop/" pasa req.url SIN "/shop".
+ * Acá lo reponemos: "/" -> "/shop/", "/product/303" -> "/shop/product/303"
  */
 const shopProxy = makeProxy(SHOP_UPSTREAM, {
-  // app.use("/shop/", ...) entrega path tipo "/" o "/product/303"
-  // NO reinyectamos /shop
-  pathRewrite: (path) => ensureSlashStart(path),
+  pathRewrite: (path) => joinPrefix(FRONTEND_INDEX_PATH, path),
 });
 
 /**
- * ✅ Compat assets raíz: /assets/* -> /assets/*
+ * ✅ Compat: si el build/algún HTML pide /assets/* en raíz
+ * /assets/x -> /assets/x (proxy directo)
  */
 const rootAssetsProxy = makeProxy(SHOP_UPSTREAM);
 
 /**
- * ✅ API: /api/* -> /api/v1/*
+ * ✅ API proxy
+ * /api/... -> /api/v1/...
+ * si ya viene /api/v1 no lo duplica
  */
 const apiProxy = makeProxy(API_ORIGIN, {
   pathRewrite: (path) => {
@@ -116,39 +134,40 @@ const apiProxy = makeProxy(API_ORIGIN, {
 });
 
 /**
- * ✅ APP
+ * ✅ APP proxy (si lo usás)
  */
 const appProxy = makeProxy(APP_UPSTREAM);
 
 // ====== Redirects base ======
-app.get("/", (req, res) => res.redirect(301, "/shop/"));
+app.get("/", (req, res) =>
+  res.redirect(301, removeTrailingSlash(FRONTEND_INDEX_PATH) + "/")
+);
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 
 // ====== ✅ MOUNTS (ORDEN IMPORTA) ======
 
-// 1) assets bajo /shop (primero)
-app.use("/shop/assets/", shopAssetsProxy);
+// ✅ 1) assets de vite bajo /shop (PRIMERO)
+app.use("/shop/assets/", shopAssetsFirstProxy);
 
-// 2) compat assets raíz
+// ✅ 2) compat assets en raíz (por si algo pide /assets/*)
 app.use("/assets/", rootAssetsProxy);
 
-// 3) compat favicons (raíz y bajo /shop)
+// ✅ 3) compat estáticos típicos en raíz
 app.get("/favicon.ico", rootAssetsProxy);
-app.get("/shop/favicon.ico", rootAssetsProxy);
 app.get("/robots.txt", rootAssetsProxy);
 app.get("/manifest.webmanifest", rootAssetsProxy);
 app.get("/manifest.json", rootAssetsProxy);
 
-// 4) shop general
+// ✅ 4) shop general (DESPUÉS)
 app.use("/shop/", shopProxy);
 
-// 5) api
+// ✅ 5) api
 app.use("/api/", apiProxy);
 
-// 6) app
+// ✅ 6) app/backoffice
 app.use("/app/", appProxy);
 
-// ====== 404 ======
+// ====== 404 edge ======
 app.use((req, res) => {
   res.setHeader("X-EDGE-HIT", "edge-404");
   res.status(404).json({ ok: false, error: "Not Found", path: req.originalUrl });
@@ -161,4 +180,5 @@ app.listen(PORT, () => {
   console.log(`api -> ${API_ORIGIN}${API_BASE}`);
   console.log(`app -> ${APP_UPSTREAM}`);
   console.log(`PUBLIC_BASE_URL -> ${PUBLIC_BASE_URL}`);
+  console.log(`FRONTEND_INDEX_PATH -> ${FRONTEND_INDEX_PATH}`);
 });
