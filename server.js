@@ -1,25 +1,23 @@
 /**
  * ✅ pos360-edge/server.js
- * Reverse proxy por PATH (SIN loops)
+ * FIX: Express al montar "/shop/" recorta req.url (pierde el prefijo).
+ * Solución: re-inyectar "/shop" antes de proxy_pass.
  *
- * /            -> 301 /shop/
- * /shop        -> 301 /shop/
- * /shop/*      -> proxy SHOP_UPSTREAM (sin redirects)
- * /api/*       -> proxy API_UPSTREAM
- * /app/*       -> proxy APP_UPSTREAM (+ reescritura Location /auth -> /app/auth)
- * /health      -> ok
+ * Rutas:
+ *  - /health        -> 200
+ *  - /              -> 301 /shop/
+ *  - /shop          -> 301 /shop/
+ *  - /shop/*        -> proxy a frontend PRESERVANDO /shop
+ *  - /assets/*      -> (compat) proxy a frontend como /shop/assets/*
+ *  - /favicon.ico   -> (compat) proxy a frontend como /shop/favicon.ico
+ *  - /api/*         -> proxy a API
+ *  - /app/*         -> proxy a APP (si aplica)
  */
 
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
-
-// ✅ Imprescindible detrás de Nginx/CapRover (respeta X-Forwarded-Proto)
-app.set("trust proxy", true);
-
-// ✅ Diferenciar /shop de /shop/ (evita normalizaciones raras)
-app.enable("strict routing");
 
 function env(name, fallback) {
   const v = process.env[name];
@@ -28,108 +26,129 @@ function env(name, fallback) {
     : fallback;
 }
 
+function ensureSlashStart(p) {
+  if (!p) return "/";
+  return p.startsWith("/") ? p : `/${p}`;
+}
+function removeTrailingSlash(p) {
+  return p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p;
+}
+function joinPrefix(prefix, path) {
+  // prefix: "/shop/" o "/shop"
+  // path: "/product/303" o "/"
+  const pfx = removeTrailingSlash(ensureSlashStart(prefix));
+  const pth = ensureSlashStart(path);
+  if (pth === "/") return `${pfx}/`;
+  return `${pfx}${pth}`;
+}
+
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
 const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
 // Upstreams
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend");
-const API_UPSTREAM = env("API_UPSTREAM", "http://srv-captain--pos360-commerce-api:3000/api/v1");
 const APP_UPSTREAM = env("APP_UPSTREAM", "http://srv-captain--pos360-admin");
+const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000");
+const API_BASE = env("API_BASE", "/api/v1"); // si no lo seteás, default /api/v1
 
-// ---- Health ----
+// Base pública
+const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com");
+
+// Donde vive el frontend (IMPORTANTE)
+const FRONTEND_INDEX_PATH = env("FRONTEND_INDEX_PATH", "/shop/"); // => "/shop/"
+
+// ====== Core settings ======
+app.disable("x-powered-by");
+// 🔥 IMPORTANTE para evitar equivalencia /shop y /shop/
+app.enable("strict routing");
+
+// ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_NO_LOOP_SHOP_02");
+  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_NO_LOOP_SHOP_03");
   res.json({
     ok: true,
     edge: "pos360-edge",
     time: new Date().toISOString(),
-    host: req.headers.host,
+    host: req.headers.host || null,
     proto: req.headers["x-forwarded-proto"] || req.protocol,
   });
 });
 
-// ---- Debug rápido (podés apagarlo después) ----
-app.use((req, res, next) => {
-  if (PROXY_LOG_LEVEL === "debug") {
-    console.log(
-      `[EDGE] ${req.method} ${req.originalUrl} host=${req.headers.host} xfproto=${req.headers["x-forwarded-proto"]} proto=${req.protocol}`
-    );
-  }
-  next();
+// ====== Helpers: proxy builder ======
+function makeProxy(target, opts = {}) {
+  return createProxyMiddleware({
+    target,
+    changeOrigin: true,
+    logLevel: PROXY_LOG_LEVEL,
+    xfwd: true,
+    secure: false, // por si target es http interno
+    ...opts,
+    onProxyReq(proxyReq, req, res) {
+      // Host real
+      proxyReq.setHeader("Host", req.headers.host || "");
+      if (opts.onProxyReq) opts.onProxyReq(proxyReq, req, res);
+    },
+  });
+}
+
+// ====== SHOP proxy (PRESERVA /shop) ======
+const shopProxy = makeProxy(SHOP_UPSTREAM, {
+  /**
+   * Express al montar "/shop/" pasa req.url SIN "/shop".
+   * Acá lo reponemos: "/" -> "/shop/", "/product/303" -> "/shop/product/303"
+   */
+  pathRewrite: (path, req) => {
+    return joinPrefix(FRONTEND_INDEX_PATH, path);
+  },
 });
 
-// ✅ Redirects EXACTOS (sin tocar /shop/)
-app.get("/", (req, res) => res.redirect(301, "/shop/"));
+// ====== Compat: si el build pide /assets/* en raíz ======
+const shopAssetsProxy = makeProxy(SHOP_UPSTREAM, {
+  pathRewrite: (path) => joinPrefix(FRONTEND_INDEX_PATH, path), // /assets/x -> /shop/assets/x
+});
+
+// ====== API proxy ======
+const apiProxy = makeProxy(API_ORIGIN, {
+  pathRewrite: (path) => {
+    // /api/... -> /api/v1/...
+    // si ya viene /api/v1 no lo duplica
+    const base = ensureSlashStart(API_BASE);
+    if (path.startsWith(base)) return path;
+    return `${removeTrailingSlash(base)}${ensureSlashStart(path)}`;
+  },
+});
+
+// ====== APP proxy (si lo usás) ======
+const appProxy = makeProxy(APP_UPSTREAM);
+
+// ====== Redirects base ======
+app.get("/", (req, res) => res.redirect(301, removeTrailingSlash(FRONTEND_INDEX_PATH) + "/"));
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 
-// ===== SHOP PROXY (NUNCA REDIRECT) =====
-const shopProxy = createProxyMiddleware({
-  target: SHOP_UPSTREAM,
-  changeOrigin: true,
-  logLevel: PROXY_LOG_LEVEL,
-  // ✅ mantiene /shop/... tal cual
-  onProxyReq: (proxyReq, req, res) => {
-    // Asegurar headers forward correctos
-    proxyReq.setHeader("X-Forwarded-Proto", req.headers["x-forwarded-proto"] || req.protocol);
-    proxyReq.setHeader("X-Forwarded-Host", req.headers.host || "");
-  },
-  onProxyRes: (proxyRes, req, res) => {
-    // ✅ Nunca permitir que se "auto-redirija" /shop/ -> /shop/
-    const loc = proxyRes.headers["location"];
-    if (loc && (loc === "/shop/" || loc === `${req.protocol}://${req.headers.host}/shop/`)) {
-      delete proxyRes.headers["location"];
-      // No cambiamos status; pero esto evita el loop si algún upstream mete loc igual
-    }
-  },
-});
+// ====== Compat assets raíz (evita “a veces rompe”) ======
+app.use("/assets/", shopAssetsProxy);
+app.get("/favicon.ico", shopAssetsProxy);
+app.get("/robots.txt", shopAssetsProxy);
+app.get("/manifest.webmanifest", shopAssetsProxy);
+app.get("/manifest.json", shopAssetsProxy);
 
+// ====== Mounts principales ======
 app.use("/shop/", shopProxy);
+app.use("/api/", apiProxy);
+app.use("/app/", appProxy);
 
-// ===== API PROXY =====
-app.use(
-  "/api/",
-  createProxyMiddleware({
-    target: API_UPSTREAM,
-    changeOrigin: true,
-    logLevel: PROXY_LOG_LEVEL,
-    pathRewrite: (path) => path.replace(/^\/api\//, "/"),
-  })
-);
-
-// ===== APP PROXY =====
-app.use(
-  "/app/",
-  createProxyMiddleware({
-    target: APP_UPSTREAM,
-    changeOrigin: true,
-    logLevel: PROXY_LOG_LEVEL,
-    pathRewrite: (path) => path.replace(/^\/app\//, "/"),
-    onProxyRes: (proxyRes) => {
-      // Reescribe Location: /auth -> /app/auth (y similares)
-      const loc = proxyRes.headers["location"];
-      if (!loc) return;
-
-      // Solo para redirects relativos
-      if (loc.startsWith("/")) {
-        // si redirige a /auth o /login, lo metemos bajo /app
-        proxyRes.headers["location"] = "/app" + loc;
-      }
-    },
-  })
-);
-
-// ---- Favicon fallback (evita 404 raros) ----
-app.get("/favicon.ico", (req, res) => res.redirect(302, "/shop/favicon.ico"));
-
-// ---- 404 explícito ----
+// ====== 404 edge ======
 app.use((req, res) => {
   res.setHeader("X-EDGE-HIT", "edge-404");
   res.status(404).json({ ok: false, error: "Not Found", path: req.originalUrl });
 });
 
+// ====== Start ======
 app.listen(PORT, () => {
   console.log(`✅ pos360-edge listo en :${PORT}`);
   console.log(`shop -> ${SHOP_UPSTREAM}`);
-  console.log(`api  -> ${API_UPSTREAM}`);
-  console.log(`app  -> ${APP_UPSTREAM}`);
+  console.log(`api -> ${API_ORIGIN}${API_BASE}`);
+  console.log(`app -> ${APP_UPSTREAM}`);
+  console.log(`PUBLIC_BASE_URL -> ${PUBLIC_BASE_URL}`);
+  console.log(`FRONTEND_INDEX_PATH -> ${FRONTEND_INDEX_PATH}`);
 });
