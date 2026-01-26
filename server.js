@@ -7,13 +7,17 @@
  * - Warning de Facebook: inyecta fb:app_id si hay FB_APP_ID
  * - Bug de assets: si el HTML viene con "/app/assets/" lo reescribe a "/shop/assets/" para rutas /shop/*
  * - Mantiene tus proxys existentes: /shop, /shop/assets, /assets, /api, /api/v1, /public, /app (transparente a /shop/app)
+ * - ✅ FIX PNG OG DEFAULT: sirve /og-default.png con Content-Type image/png (evita 404/JSON y “tipo de contenido no válido”)
  *
  * Resultado:
  * - Facebook debugger deja de ver __OG_TITLE__ y te muestra OG reales (por lo menos default)
  * - Si tu frontend no inyecta server-side, el edge lo hace para bots
+ * - og:image ahora apunta a una URL que EXISTE y devuelve image/png
  */
 
 const express = require("express");
+const path = require("path");
+const fs = require("fs");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
@@ -66,13 +70,17 @@ const OG_DESCRIPTION_DEFAULT = env(
 const OG_IMAGE_DEFAULT = env("OG_IMAGE_DEFAULT", `${PUBLIC_BASE_URL}/og-default.png`);
 const FB_APP_ID = env("FB_APP_ID", ""); // opcional: si lo ponés, desaparece el warning
 
+// ✅ Ruta local del PNG (metelo en el repo del edge)
+// pos360-edge/public/og-default.png
+const OG_DEFAULT_FILE = path.join(__dirname, "public", "og-default.png");
+
 // ====== Core settings ======
 app.disable("x-powered-by");
 app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_OG_INJECT_BOTS_ASSETFIX_01");
+  res.setHeader("X-EDGE-BUILD", "EDGE_OG_INJECT_BOTS_ASSETFIX_02_OGPNG");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -80,6 +88,51 @@ app.get("/health", (req, res) => {
     host: req.headers.host || null,
     proto: req.headers["x-forwarded-proto"] || req.protocol,
   });
+});
+
+// ====== ✅ OG DEFAULT PNG (ANTES DE TODO) ======
+// Facebook exige que og:image sea accesible y con Content-Type correcto.
+// - Si existe local => lo sirve como image/png.
+// - Si no existe local => fallback proxy al SHOP_UPSTREAM (por si el FE lo tiene).
+app.get("/og-default.png", async (req, res, next) => {
+  try {
+    if (fs.existsSync(OG_DEFAULT_FILE)) {
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.setHeader("X-EDGE-HIT", "og-default-local");
+      return res.sendFile(OG_DEFAULT_FILE);
+    }
+
+    // Fallback: intentar fetch al upstream (por si está en public del FE)
+    const url = `${removeTrailingSlash(SHOP_UPSTREAM)}/og-default.png`;
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 6000);
+
+    const resp = await fetch(url, { method: "GET", signal: controller.signal }).finally(() =>
+      clearTimeout(t)
+    );
+
+    const buf = Buffer.from(await resp.arrayBuffer());
+    const ct = String(resp.headers.get("content-type") || "");
+
+    if (resp.ok && ct.toLowerCase().includes("image/")) {
+      res.status(200);
+      res.setHeader("Content-Type", ct || "image/png");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.setHeader("X-EDGE-HIT", "og-default-upstream");
+      return res.send(buf);
+    }
+
+    res.setHeader("X-EDGE-HIT", "og-default-missing");
+    return res.status(404).json({
+      ok: false,
+      error: "og-default.png not found",
+      hint: "Add pos360-edge/public/og-default.png or ensure frontend serves /og-default.png as image/*",
+    });
+  } catch (e) {
+    console.error("❌ /og-default.png error:", e && e.message ? e.message : e);
+    next();
+  }
 });
 
 // ====== Helpers: proxy builder ======
@@ -143,10 +196,12 @@ function injectFbAppId(html) {
   if (html.includes('property="fb:app_id"') || html.includes("property='fb:app_id'")) {
     return html;
   }
-  // lo metemos cerca del OG block si existe, sino antes de </head>
   const meta = `\n    <meta property="fb:app_id" content="${FB_APP_ID}" />\n`;
   if (html.includes('property="og:type"')) {
-    return html.replace('property="og:type"', `property="fb:app_id" content="${FB_APP_ID}" />\n    <meta property="og:type"`);
+    return html.replace(
+      'property="og:type"',
+      `property="fb:app_id" content="${FB_APP_ID}" />\n    <meta property="og:type"`
+    );
   }
   return html.replace("</head>", `${meta}</head>`);
 }
@@ -155,7 +210,6 @@ function replaceTokens(html, req) {
   const fullUrl = `${PUBLIC_BASE_URL}${req.originalUrl}`;
   const canonical = fullUrl;
 
-  // ✅ Reemplazo de placeholders
   let out = html
     .replaceAll("__TITLE__", OG_TITLE_DEFAULT)
     .replaceAll("__DESCRIPTION__", OG_DESCRIPTION_DEFAULT)
@@ -168,8 +222,6 @@ function replaceTokens(html, req) {
     .replaceAll("__OG_IMAGE__", OG_IMAGE_DEFAULT)
     .replaceAll("__OG_IMAGE_ALT__", OG_TITLE_DEFAULT);
 
-  // ✅ Fix assets mismatch: si el HTML vino con /app/assets para una URL /shop/*
-  // (esto te está pasando ahora mismo)
   if (req.originalUrl.startsWith("/shop/")) {
     out = out
       .replaceAll('src="/app/assets/', 'src="/shop/assets/')
@@ -178,27 +230,18 @@ function replaceTokens(html, req) {
       .replaceAll("href='/app/assets/", "href='/shop/assets/");
   }
 
-  // ✅ opcional: algunos templates usan /assets/ directo
-  // tu edge ya soporta /assets/* compat, así que no toca.
-
-  // ✅ Inyecta fb:app_id si corresponde
   out = injectFbAppId(out);
-
   return out;
 }
 
 async function fetchUpstreamHtml(pathname) {
-  // Node 18+ tiene fetch global
   const url = `${removeTrailingSlash(SHOP_UPSTREAM)}${pathname}`;
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 6000);
 
   const resp = await fetch(url, {
     method: "GET",
-    headers: {
-      // pedimos HTML
-      Accept: "text/html,*/*;q=0.8",
-    },
+    headers: { Accept: "text/html,*/*;q=0.8" },
     signal: controller.signal,
   }).finally(() => clearTimeout(t));
 
@@ -221,16 +264,15 @@ async function botOgMiddleware(req, res, next) {
       req.originalUrl.startsWith("/assets/") ||
       req.originalUrl.startsWith("/api/") ||
       req.originalUrl.startsWith("/public/") ||
-      req.originalUrl.startsWith("/app/")
+      req.originalUrl.startsWith("/app/") ||
+      req.originalUrl === "/og-default.png"
     ) {
       return next();
     }
 
-    // Pedimos al upstream el HTML REAL (ya con /shop prefix reinyectado)
-    const upstreamPath = joinPrefix(FRONTEND_INDEX_PATH, req.path); // "/shop" + "/product/303"
+    const upstreamPath = joinPrefix(FRONTEND_INDEX_PATH, req.path);
     const { status, contentType, body } = await fetchUpstreamHtml(upstreamPath);
 
-    // Si no es HTML, no tocamos
     if (!String(contentType).toLowerCase().includes("text/html")) {
       res.status(status).send(body);
       return;
@@ -247,51 +289,30 @@ async function botOgMiddleware(req, res, next) {
     res.send(patched);
   } catch (e) {
     console.error("❌ botOgMiddleware error:", e && e.message ? e.message : e);
-    // si falla, no rompemos navegación
     next();
   }
 }
 
 // ====== Proxys ======
 
-/**
- * ✅ 1) SHOP ASSETS FIRST
- * Montado en "/shop/assets/" => al proxy le llega "/index-xxx.js"
- * Necesitamos mandarlo al upstream como "/assets/index-xxx.js"
- */
 const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
 });
 
-/**
- * ✅ 2) SHOP proxy general (PRESERVA /shop)
- */
 const shopProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (path) => joinPrefix(FRONTEND_INDEX_PATH, path),
 });
 
-/**
- * ✅ 3) APP proxy TRANSPARENTE: /app/* -> /shop/app/*
- */
 const appProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (path) => joinPrefix(APP_INDEX_PATH, path),
 });
 
-/**
- * ✅ Compat: /assets/*
- */
 const rootAssetsProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
 });
 
-/**
- * ✅ Compat: estáticos raíz
- */
 const rootStaticProxy = makeProxy(SHOP_UPSTREAM);
 
-/**
- * ✅ API proxy /api -> /api/v1
- */
 const apiProxy = makeProxy(API_ORIGIN, {
   pathRewrite: (path) => {
     const base = ensureSlashStart(API_BASE);
@@ -300,14 +321,7 @@ const apiProxy = makeProxy(API_ORIGIN, {
   },
 });
 
-/**
- * ✅ /api/v1/* directo
- */
 const apiV1CompatProxy = makeProxy(API_ORIGIN);
-
-/**
- * ✅ /public/* directo
- */
 const publicCompatProxy = makeProxy(API_ORIGIN);
 
 // ====== Redirects base ======
@@ -319,32 +333,24 @@ app.get("/app", (req, res) => res.redirect(301, "/app/"));
 
 // ====== ✅ MOUNTS (ORDEN IMPORTA) ======
 
-// ✅ 0) BOT OG injector (ANTES que el proxy de shop)
 app.use("/shop/", botOgMiddleware);
 
-// ✅ 1) assets de vite bajo /shop (PRIMERO)
 app.use("/shop/assets/", shopAssetsFirstProxy);
 
-// ✅ 2) compat assets en raíz
 app.use("/assets/", rootAssetsProxy);
 
-// ✅ 3) compat estáticos típicos en raíz
 app.get("/favicon.ico", rootStaticProxy);
 app.get("/robots.txt", rootStaticProxy);
 app.get("/manifest.webmanifest", rootStaticProxy);
 app.get("/manifest.json", rootStaticProxy);
 
-// ✅ 4) APP
 app.use("/app/", appProxy);
 
-// ✅ 5) shop general
 app.use("/shop/", shopProxy);
 
-// ✅ 6) compat API primero
 app.use("/api/v1/", apiV1CompatProxy);
 app.use("/public/", publicCompatProxy);
 
-// ✅ 7) api “oficial”
 app.use("/api/", apiProxy);
 
 // ====== 404 edge ======
@@ -363,4 +369,5 @@ app.listen(PORT, () => {
   console.log(`FRONTEND_INDEX_PATH -> ${FRONTEND_INDEX_PATH}`);
   console.log(`APP_INDEX_PATH -> ${APP_INDEX_PATH}`);
   console.log(`FB_APP_ID -> ${FB_APP_ID ? "SET" : "NOT_SET"}`);
+  console.log(`OG_DEFAULT_FILE -> ${OG_DEFAULT_FILE}`);
 });
