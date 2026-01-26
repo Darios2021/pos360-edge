@@ -24,6 +24,12 @@
  *  - /api/v1/*      -> ✅ compat directo a API (builds que llaman /api/v1)
  *  - /public/*      -> ✅ compat directo a API (por si alguna vez se usa)
  *  - /app/*         -> proxy a APP (si aplica)
+ *
+ * ✅ NEW (tu caso real):
+ * - Backoffice coexiste en el MISMO frontend (pos360-frontend)
+ * - Entonces /app/* debe ir al mismo upstream que shop
+ * - Activable con APP_SAME_AS_SHOP=1
+ * - Soporta /app/assets/* también
  */
 
 const express = require("express");
@@ -36,6 +42,13 @@ function env(name, fallback) {
   return v !== undefined && v !== null && String(v).trim() !== ""
     ? String(v).trim()
     : fallback;
+}
+
+function envBool(name, fallback = false) {
+  const v = process.env[name];
+  if (v === undefined || v === null || String(v).trim() === "") return fallback;
+  const s = String(v).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on";
 }
 
 function ensureSlashStart(p) {
@@ -63,6 +76,10 @@ const APP_UPSTREAM = env("APP_UPSTREAM", "http://srv-captain--pos360-admin");
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000");
 const API_BASE = env("API_BASE", "/api/v1"); // default
 
+// ✅ NEW: si el backoffice vive en el MISMO frontend que /shop
+const APP_SAME_AS_SHOP = envBool("APP_SAME_AS_SHOP", false);
+const APP_INDEX_PATH = env("APP_INDEX_PATH", "/app/"); // "/app/"
+
 // Base pública (no se usa en routing, queda para logs/debug)
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com");
 
@@ -76,13 +93,14 @@ app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_ASSETS_FIRST_02_API_COMPAT_01");
+  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_ASSETS_FIRST_02_API_COMPAT_02_APP_COMPAT_01");
   res.json({
     ok: true,
     edge: "pos360-edge",
     time: new Date().toISOString(),
     host: req.headers.host || null,
     proto: req.headers["x-forwarded-proto"] || req.protocol,
+    app_same_as_shop: APP_SAME_AS_SHOP,
   });
 });
 
@@ -113,12 +131,30 @@ const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
 });
 
 /**
+ * ✅ NEW: APP ASSETS FIRST (si backoffice vive en /app)
+ * Montado en "/app/assets/" => al proxy le llega "/index-xxx.js"
+ * Necesitamos mandarlo al upstream como "/assets/index-xxx.js"
+ */
+const appAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
+  pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
+});
+
+/**
  * ✅ 2) SHOP proxy general (PRESERVA /shop)
  * Express al montar "/shop/" pasa req.url SIN "/shop".
  * Acá lo reponemos: "/" -> "/shop/", "/product/303" -> "/shop/product/303"
  */
 const shopProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (path) => joinPrefix(FRONTEND_INDEX_PATH, path),
+});
+
+/**
+ * ✅ NEW: APP proxy cuando APP_SAME_AS_SHOP=1 (backoffice en mismo frontend)
+ * Express al montar "/app/" pasa req.url SIN "/app".
+ * Reponemos: "/" -> "/app/", "/users" -> "/app/users"
+ */
+const appProxySameFrontend = makeProxy(SHOP_UPSTREAM, {
+  pathRewrite: (path) => joinPrefix(APP_INDEX_PATH, path),
 });
 
 /**
@@ -167,6 +203,7 @@ const publicCompatProxy = makeProxy(API_ORIGIN);
 
 /**
  * ✅ APP proxy (si lo usás)
+ * (Se mantiene, pero en tu caso probablemente no se usa)
  */
 const appProxy = makeProxy(APP_UPSTREAM);
 
@@ -176,10 +213,16 @@ app.get("/", (req, res) =>
 );
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 
+// ✅ NEW: si entran a /app sin slash, lo normalizamos
+app.get("/app", (req, res) => res.redirect(301, "/app/"));
+
 // ====== ✅ MOUNTS (ORDEN IMPORTA) ======
 
 // ✅ 1) assets de vite bajo /shop (PRIMERO)
 app.use("/shop/assets/", shopAssetsFirstProxy);
+
+// ✅ NEW: assets bajo /app (también primero)
+app.use("/app/assets/", appAssetsFirstProxy);
 
 // ✅ 2) compat assets en raíz (por si algo pide /assets/*)
 app.use("/assets/", rootAssetsProxy);
@@ -201,7 +244,12 @@ app.use("/public/", publicCompatProxy);
 app.use("/api/", apiProxy);
 
 // ✅ 7) app/backoffice
-app.use("/app/", appProxy);
+// ✅ NEW: si coexiste en el mismo frontend, lo mandamos al SHOP_UPSTREAM
+if (APP_SAME_AS_SHOP) {
+  app.use("/app/", appProxySameFrontend);
+} else {
+  app.use("/app/", appProxy);
+}
 
 // ====== 404 edge ======
 app.use((req, res) => {
@@ -214,7 +262,9 @@ app.listen(PORT, () => {
   console.log(`✅ pos360-edge listo en :${PORT}`);
   console.log(`shop -> ${SHOP_UPSTREAM}`);
   console.log(`api -> ${API_ORIGIN}${API_BASE}`);
-  console.log(`app -> ${APP_UPSTREAM}`);
+  console.log(`app -> ${APP_SAME_AS_SHOP ? SHOP_UPSTREAM + " (same as shop)" : APP_UPSTREAM}`);
   console.log(`PUBLIC_BASE_URL -> ${PUBLIC_BASE_URL}`);
   console.log(`FRONTEND_INDEX_PATH -> ${FRONTEND_INDEX_PATH}`);
+  console.log(`APP_INDEX_PATH -> ${APP_INDEX_PATH}`);
+  console.log(`APP_SAME_AS_SHOP -> ${APP_SAME_AS_SHOP}`);
 });
