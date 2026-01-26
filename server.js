@@ -441,7 +441,12 @@ async function fetchProductOg(productId, branchId) {
 }
 
 function replaceTokens(html, req, overrides = null) {
-  const fullUrl = `${PUBLIC_BASE_URL}${req.originalUrl}`;
+  const baseUrl = `${PUBLIC_BASE_URL}${req.path}`;
+const version = overrides?.ogImage
+  ? (overrides.ogImage.match(/[?&]v=([^&]+)/)?.[1] || Date.now())
+  : Date.now();
+const fullUrl = `${baseUrl}?ogv=${version}`;
+
   const canonical = fullUrl;
 
   const ogTitle = overrides?.ogTitle || OG_TITLE_DEFAULT;
