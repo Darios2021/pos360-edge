@@ -7,17 +7,17 @@
  * - Warning de Facebook: inyecta fb:app_id si hay FB_APP_ID
  * - Bug de assets: si el HTML viene con "/app/assets/" lo reescribe a "/shop/assets/" para rutas /shop/*
  * - Mantiene tus proxys existentes: /shop, /shop/assets, /assets, /api, /api/v1, /public, /app (transparente a /shop/app)
- * - ✅ FIX PNG OG DEFAULT: sirve /og-default.png con Content-Type image/png (evita 404/JSON y “tipo de contenido no válido”)
+ * - ✅ FIX OG IMAGE: /og-default.png SIEMPRE responde image/png y tamaño >= 200x200 (genera 1200x630 si no hay archivo)
  *
  * Resultado:
  * - Facebook debugger deja de ver __OG_TITLE__ y te muestra OG reales (por lo menos default)
- * - Si tu frontend no inyecta server-side, el edge lo hace para bots
- * - og:image ahora apunta a una URL que EXISTE y devuelve image/png
+ * - og:image ahora apunta a una URL que EXISTE, devuelve image/png, y NO es “demasiado pequeña”
  */
 
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
+const zlib = require("zlib");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
@@ -70,7 +70,7 @@ const OG_DESCRIPTION_DEFAULT = env(
 const OG_IMAGE_DEFAULT = env("OG_IMAGE_DEFAULT", `${PUBLIC_BASE_URL}/og-default.png`);
 const FB_APP_ID = env("FB_APP_ID", ""); // opcional: si lo ponés, desaparece el warning
 
-// ✅ Ruta local del PNG (metelo en el repo del edge)
+// ✅ Ruta local del PNG (si la tenés, se usa)
 // pos360-edge/public/og-default.png
 const OG_DEFAULT_FILE = path.join(__dirname, "public", "og-default.png");
 
@@ -80,7 +80,7 @@ app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_OG_INJECT_BOTS_ASSETFIX_02_OGPNG");
+  res.setHeader("X-EDGE-BUILD", "EDGE_OG_INJECT_BOTS_ASSETFIX_03_OGPNG_1200x630");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -90,14 +90,81 @@ app.get("/health", (req, res) => {
   });
 });
 
+// ====== PNG generator (sin deps) ======
+let __crcTable = null;
+function crc32(buf) {
+  if (!__crcTable) {
+    __crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      __crcTable[n] = c >>> 0;
+    }
+  }
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = __crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const typeBuf = Buffer.from(type, "ascii");
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32BE(data.length, 0);
+
+  const crcBuf = Buffer.alloc(4);
+  const crcVal = crc32(Buffer.concat([typeBuf, data]));
+  crcBuf.writeUInt32BE(crcVal, 0);
+
+  return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+}
+
+function createSolidPng(width, height, rgba = [245, 245, 245, 255]) {
+  const [r, g, b, a] = rgba;
+
+  // Raw scanlines: each row starts with filter byte 0, then RGBA pixels
+  const rowLen = 1 + width * 4;
+  const raw = Buffer.alloc(rowLen * height);
+
+  const row = Buffer.alloc(rowLen);
+  row[0] = 0; // filter type 0
+  for (let x = 0; x < width; x++) {
+    const o = 1 + x * 4;
+    row[o] = r;
+    row[o + 1] = g;
+    row[o + 2] = b;
+    row[o + 3] = a;
+  }
+  for (let y = 0; y < height; y++) row.copy(raw, y * rowLen);
+
+  const compressed = zlib.deflateSync(raw, { level: 9 });
+
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // RGBA
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter
+  ihdr[12] = 0; // interlace
+
+  return Buffer.concat([
+    sig,
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", compressed),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+// ✅ buffer generado 1200x630 (cumple mínimo 200x200 y formato OG recomendado)
+const OG_DEFAULT_PNG_BUFFER = createSolidPng(1200, 630, [245, 245, 245, 255]);
+
 // ====== ✅ OG DEFAULT PNG (ANTES DE TODO) ======
 // - Si existe public/og-default.png => lo sirve
-// - Si NO existe => devuelve un PNG mínimo válido 1x1 (Facebook debería aceptarlo si ve image/png real)
+// - Si NO existe => intenta upstream
+// - Si no hay upstream => genera 1200x630 (NO “demasiado pequeña”)
 app.get("/og-default.png", async (req, res) => {
-  // PNG 1x1 transparente (válido)
-  const PNG_1x1_TRANSPARENT_BASE64 =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIW2P4//8/AwAI/AL+X8nG5QAAAABJRU5ErkJggg==";
-
   try {
     // 1) archivo local
     if (fs.existsSync(OG_DEFAULT_FILE)) {
@@ -109,7 +176,6 @@ app.get("/og-default.png", async (req, res) => {
 
     // 2) upstream (si el FE lo tiene)
     const upstreamUrl = `${removeTrailingSlash(SHOP_UPSTREAM)}/og-default.png`;
-
     try {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), 5000);
@@ -131,24 +197,20 @@ app.get("/og-default.png", async (req, res) => {
       // ignore y caemos al generado
     }
 
-    // 3) generado (siempre 200 + image/png)
-    const buf = Buffer.from(PNG_1x1_TRANSPARENT_BASE64, "base64");
+    // 3) generado 1200x630
     res.status(200);
     res.setHeader("Content-Type", "image/png");
-    res.setHeader("Cache-Control", "public, max-age=300");
+    res.setHeader("Cache-Control", "public, max-age=86400");
     res.setHeader("X-EDGE-HIT", "og-default-generated");
-    return res.send(buf);
+    return res.send(OG_DEFAULT_PNG_BUFFER);
   } catch (e) {
-    const buf = Buffer.from(PNG_1x1_TRANSPARENT_BASE64, "base64");
     res.status(200);
     res.setHeader("Content-Type", "image/png");
-    res.setHeader("Cache-Control", "public, max-age=300");
+    res.setHeader("Cache-Control", "public, max-age=86400");
     res.setHeader("X-EDGE-HIT", "og-default-generated");
-    return res.send(buf);
+    return res.send(OG_DEFAULT_PNG_BUFFER);
   }
 });
-
-
 
 // ====== Helpers: proxy builder ======
 function makeProxy(target, opts = {}) {
@@ -196,13 +258,12 @@ function isBot(req) {
     ua.includes("linkedinbot") ||
     ua.includes("slackbot") ||
     ua.includes("pinterest") ||
-    ua.includes("googlebot") // opcional, ayuda SEO
+    ua.includes("googlebot")
   );
 }
 
 function wantsHtml(req) {
   const accept = String(req.headers.accept || "").toLowerCase();
-  // si no hay accept, igual muchos bots scrapean sin accept fuerte
   return !accept || accept.includes("text/html") || accept.includes("*/*");
 }
 
@@ -266,14 +327,12 @@ async function fetchUpstreamHtml(pathname) {
   return { status: resp.status, contentType: ct, body: text };
 }
 
-// Middleware que solo aplica a BOTS para /shop/*
 async function botOgMiddleware(req, res, next) {
   try {
     if (req.method !== "GET" && req.method !== "HEAD") return next();
     if (!isBot(req)) return next();
     if (!wantsHtml(req)) return next();
 
-    // 🔥 Ignorar assets/api/etc
     if (
       req.originalUrl.startsWith("/shop/assets/") ||
       req.originalUrl.startsWith("/assets/") ||
@@ -347,7 +406,6 @@ app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 app.get("/app", (req, res) => res.redirect(301, "/app/"));
 
 // ====== ✅ MOUNTS (ORDEN IMPORTA) ======
-
 app.use("/shop/", botOgMiddleware);
 
 app.use("/shop/assets/", shopAssetsFirstProxy);
