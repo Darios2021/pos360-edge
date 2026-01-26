@@ -1,29 +1,11 @@
 /**
  * ✅ pos360-edge/server.js
- * ✅ COPY-PASTE FINAL DEFINITIVO (FIX ASSETS 404 + /shop + compat /assets + compat /api/v1)
+ * ✅ COPY-PASTE FINAL DEFINITIVO (TU BASE ESTABLE + FIX /app + FIX compat /api/v1 + anti-crash)
  *
- * FIX CLAVE:
- * - Vite genera <script src="/shop/assets/..."> y <link href="/shop/assets/...">
- * - Express cuando montás "/shop/assets/" entrega al proxy SOLO "/index-xxx.js"
- * - Entonces el rewrite debe RE-PREFIJAR "/assets" (no hacer replace de "/shop")
- *
- * FIX API CLAVE:
- * - Tu frontend HOY está llamando "/api/v1/..." (según consola)
- * - En edge sólo existía "/api/..." => 404
- * - Solución: compat /api/v1/* (y opcional /public/*) hacia API_ORIGIN
- *
- * Rutas:
- *  - /health        -> 200
- *  - /              -> 301 /shop/
- *  - /shop          -> 301 /shop/
- *  - /shop/assets/* -> proxy a frontend como /assets/*
- *  - /shop/*        -> proxy a frontend (preserva /shop según tu diseño)
- *  - /assets/*      -> (compat) proxy a frontend como /assets/*
- *  - /favicon.ico   -> (compat) proxy a frontend como /favicon.ico
- *  - /api/*         -> proxy a API (rewrite a /api/v1/*)
- *  - /api/v1/*      -> ✅ compat directo a API (builds que llaman /api/v1)
- *  - /public/*      -> ✅ compat directo a API (por si alguna vez se usa)
- *  - /app/*         -> proxy a APP (si aplica)
+ * Mantiene TODO lo que tenías y suma:
+ * - /app/* preserva "/app" hacia el MISMO frontend (tu caso APP_UPSTREAM=pos360-frontend)
+ * - /api/v1/* compat REINYECTA "/api/v1" (porque express corta el prefijo del mount)
+ * - onError para que NO se caiga el edge y nginx no muestre 500 genérico
  */
 
 const express = require("express");
@@ -59,7 +41,11 @@ const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
 // Upstreams
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend");
-const APP_UPSTREAM = env("APP_UPSTREAM", "http://srv-captain--pos360-admin");
+
+// ⚠️ En TU setup real: APP_UPSTREAM = http://srv-captain--pos360-frontend
+// (backoffice coexiste en el mismo frontend)
+const APP_UPSTREAM = env("APP_UPSTREAM", "http://srv-captain--pos360-frontend");
+
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000");
 const API_BASE = env("API_BASE", "/api/v1"); // default
 
@@ -71,12 +57,11 @@ const FRONTEND_INDEX_PATH = env("FRONTEND_INDEX_PATH", "/shop/"); // "/shop/"
 
 // ====== Core settings ======
 app.disable("x-powered-by");
-// evita equivalencia /shop y /shop/
 app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_ASSETS_FIRST_02_API_COMPAT_01");
+  res.setHeader("X-EDGE-BUILD", "EDGE_STABLE_PLUS_APP_PLUS_APIv1_COMPAT_01");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -94,11 +79,23 @@ function makeProxy(target, opts = {}) {
     logLevel: PROXY_LOG_LEVEL,
     xfwd: true,
     secure: false, // targets internos http
+    proxyTimeout: 30_000,
+    timeout: 30_000,
     ...opts,
     onProxyReq(proxyReq, req, res) {
-      // Host real (útil para apps que generan URLs)
       proxyReq.setHeader("Host", req.headers.host || "");
       if (opts.onProxyReq) opts.onProxyReq(proxyReq, req, res);
+    },
+    onError(err, req, res) {
+      // ✅ NO CRASHEAR / NO 500 genérico de nginx
+      const code = err?.code || "PROXY_ERROR";
+      if (res.headersSent) return;
+      res.status(502).json({
+        ok: false,
+        error: "Bad Gateway",
+        code,
+        path: req.originalUrl,
+      });
     },
   });
 }
@@ -114,17 +111,13 @@ const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
 
 /**
  * ✅ 2) SHOP proxy general (PRESERVA /shop)
- * Express al montar "/shop/" pasa req.url SIN "/shop".
- * Acá lo reponemos: "/" -> "/shop/", "/product/303" -> "/shop/product/303"
  */
 const shopProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (path) => joinPrefix(FRONTEND_INDEX_PATH, path),
 });
 
 /**
- * ✅ Compat: si el build/algún HTML pide /assets/* en raíz
- * Montado en "/assets/" => al proxy le llega "/index-xxx.js"
- * Debe ir a "/assets/index-xxx.js"
+ * ✅ Compat: /assets/* en raíz
  */
 const rootAssetsProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
@@ -132,18 +125,11 @@ const rootAssetsProxy = makeProxy(SHOP_UPSTREAM, {
 
 /**
  * ✅ Compat: estáticos de raíz (favicon, robots, manifest)
- * Acá NO queremos prefijar /assets, deben pasar tal cual.
  */
 const rootStaticProxy = makeProxy(SHOP_UPSTREAM);
 
 /**
- * ✅ API proxy
- * /api/... -> /api/v1/...
- * si ya viene /api/v1 no lo duplica
- *
- * IMPORTANTE:
- * - Montado en "/api/" => al proxy le llega "/public/..."
- * - Por eso reinyectamos API_BASE
+ * ✅ API proxy: /api/* -> /api/v1/*
  */
 const apiProxy = makeProxy(API_ORIGIN, {
   pathRewrite: (path) => {
@@ -155,20 +141,33 @@ const apiProxy = makeProxy(API_ORIGIN, {
 
 /**
  * ✅ COMPAT: /api/v1/* directo a la API
- * - Montado en "/api/v1/" => al proxy le llega "/public/..."
- * - Acá NO reescribimos (va tal cual, con el prefijo ya presente en el mount)
+ *
+ * CLAVE: Montado en "/api/v1/" => al proxy le llega "/public/..."
+ * Entonces hay que REINYECTAR "/api/v1" para pegar bien.
  */
-const apiV1CompatProxy = makeProxy(API_ORIGIN);
+const apiV1CompatProxy = makeProxy(API_ORIGIN, {
+  pathRewrite: (p) => `/api/v1${ensureSlashStart(p)}`,
+});
 
 /**
- * ✅ COMPAT: /public/* directo a la API (opcional, útil)
+ * ✅ COMPAT: /public/* directo a la API (opcional)
+ * lo mapeamos a /api/v1/public/*
  */
-const publicCompatProxy = makeProxy(API_ORIGIN);
+const publicCompatProxy = makeProxy(API_ORIGIN, {
+  pathRewrite: (p) => `/api/v1/public${ensureSlashStart(p)}`,
+});
 
 /**
- * ✅ APP proxy (si lo usás)
+ * ✅ APP proxy (backoffice)
+ *
+ * CLAVE:
+ * Montado en "/app/" => al proxy le llega "/"
+ * Si lo mandás como "/" el upstream te redirige a "/shop/" (tu síntoma).
+ * Entonces reinyectamos "/app".
  */
-const appProxy = makeProxy(APP_UPSTREAM);
+const appProxy = makeProxy(APP_UPSTREAM, {
+  pathRewrite: (p) => `/app${ensureSlashStart(p)}`,
+});
 
 // ====== Redirects base ======
 app.get("/", (req, res) =>
@@ -176,12 +175,15 @@ app.get("/", (req, res) =>
 );
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 
+// ✅ (opcional) si querés /app -> /app/
+app.get("/app", (req, res) => res.redirect(301, "/app/"));
+
 // ====== ✅ MOUNTS (ORDEN IMPORTA) ======
 
 // ✅ 1) assets de vite bajo /shop (PRIMERO)
 app.use("/shop/assets/", shopAssetsFirstProxy);
 
-// ✅ 2) compat assets en raíz (por si algo pide /assets/*)
+// ✅ 2) compat assets en raíz
 app.use("/assets/", rootAssetsProxy);
 
 // ✅ 3) compat estáticos típicos en raíz
@@ -190,17 +192,17 @@ app.get("/robots.txt", rootStaticProxy);
 app.get("/manifest.webmanifest", rootStaticProxy);
 app.get("/manifest.json", rootStaticProxy);
 
-// ✅ 4) shop general (DESPUÉS)
+// ✅ 4) shop general
 app.use("/shop/", shopProxy);
 
-// ✅ 5) ✅ compat API PRIMERO (para tu build actual que llama /api/v1)
+// ✅ 5) ✅ compat API PRIMERO (tu build llama /api/v1)
 app.use("/api/v1/", apiV1CompatProxy);
 app.use("/public/", publicCompatProxy);
 
 // ✅ 6) api “oficial” del edge (/api -> /api/v1)
 app.use("/api/", apiProxy);
 
-// ✅ 7) app/backoffice
+// ✅ 7) ✅ app/backoffice (preserva /app)
 app.use("/app/", appProxy);
 
 // ====== 404 edge ======
