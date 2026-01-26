@@ -1,10 +1,10 @@
 /**
  * ✅ pos360-edge/server.js
- * ✅ COPY-PASTE FINAL DEFINITIVO (ESTABLE + FIX ASSETS + FIX APIv1 + FIX /app dentro del mismo frontend)
- *
- * CLAVE:
- * - Evitar que CapRover mate el contenedor por healthcheck:
- *   - "/" responde 200 para checks (y redirige solo si parece navegador)
+ * ✅ COPY-PASTE FINAL DEFINITIVO
+ * - FIX ASSETS 404 (/shop/assets -> /assets)
+ * - FIX API compat (/api/v1 y /public)
+ * - FIX 500 en /shop (NO reinyectar /shop al upstream)
+ * - /app/* redirect -> /shop/app/* (porque backoffice vive dentro del mismo frontend)
  */
 
 const express = require("express");
@@ -12,9 +12,7 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
 
-// ====================
-// HARDEN: no morir en silencio
-// ====================
+// ====== HARDEN ======
 process.on("uncaughtException", (err) => {
   console.error("❌ uncaughtException:", err && err.stack ? err.stack : err);
 });
@@ -29,24 +27,12 @@ function env(name, fallback) {
     : fallback;
 }
 
-function safePath(p) {
-  if (typeof p !== "string") return "/";
-  const s = p.trim();
-  return s ? s : "/";
-}
 function ensureSlashStart(p) {
-  p = safePath(p);
+  if (!p) return "/";
   return p.startsWith("/") ? p : `/${p}`;
 }
 function removeTrailingSlash(p) {
-  p = safePath(p);
   return p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p;
-}
-function joinPrefix(prefix, path) {
-  const pfx = removeTrailingSlash(ensureSlashStart(prefix));
-  const pth = ensureSlashStart(path);
-  if (pth === "/") return `${pfx}/`;
-  return `${pfx}${pth}`;
 }
 
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
@@ -54,28 +40,23 @@ const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
 // Upstreams
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend");
-const APP_UPSTREAM = env("APP_UPSTREAM", "http://srv-captain--pos360-frontend"); // coexiste ahí
+// (Backoffice coexiste ahí, NO usamos otro upstream)
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000");
-const API_BASE = env("API_BASE", "/api/v1");
+const API_BASE = env("API_BASE", "/api/v1"); // default
 
 // Debug
 const PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "https://sanjuantecnologia.com");
 
-// Frontend base
-const FRONTEND_INDEX_PATH = env("FRONTEND_INDEX_PATH", "/shop/");
-const APP_INDEX_PATH = env("APP_INDEX_PATH", "/shop/app/");
+// Donde “vive” públicamente
+const FRONTEND_INDEX_PATH = env("FRONTEND_INDEX_PATH", "/shop/"); // "/shop/"
+const APP_INDEX_PATH = env("APP_INDEX_PATH", "/shop/app/"); // backoffice real dentro del mismo FE
 
-// ====================
-// Core settings
-// ====================
 app.disable("x-powered-by");
 app.enable("strict routing");
 
-// ====================
-// Health real
-// ====================
+// ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_HARDENED_02_CAPROVER_HEALTHFIX_01");
+  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_SHOP500_STRIP_PREFIX_01");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -85,9 +66,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ====================
-// Proxy builder (con onError)
-// ====================
+// ====== Proxy helper ======
 function makeProxy(target, opts = {}) {
   return createProxyMiddleware({
     target,
@@ -123,62 +102,61 @@ function makeProxy(target, opts = {}) {
 
 /**
  * ✅ 1) /shop/assets/* -> /assets/*
+ * Montado en "/shop/assets/" => al proxy le llega "/index-xxx.js"
+ * Mandamos al upstream "/assets/index-xxx.js"
  */
 const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
 });
 
 /**
- * ✅ 2) /shop/* -> preservar /shop
+ * ✅ 2) SHOP proxy general (FIX 500):
+ * Montado en "/shop/" => al proxy le llega "/" o "/product/303"
+ * IMPORTANTÍSIMO: NO reinyectamos "/shop" al upstream.
+ * - /shop/            -> upstream "/"
+ * - /shop/product/303 -> upstream "/product/303"
  */
 const shopProxy = makeProxy(SHOP_UPSTREAM, {
-  pathRewrite: (p) => joinPrefix(FRONTEND_INDEX_PATH, p),
+  pathRewrite: (p) => ensureSlashStart(p),
 });
 
 /**
- * ✅ compat /assets/*
+ * ✅ Compat: /assets/* en raíz -> /assets/*
  */
 const rootAssetsProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
 });
 
 /**
- * ✅ compat estáticos raíz
+ * ✅ Compat: estáticos raíz (favicon, robots, manifest)
+ * Van tal cual
  */
 const rootStaticProxy = makeProxy(SHOP_UPSTREAM);
 
 /**
- * ✅ /api/* -> /api/v1/*
+ * ✅ API: /api/* -> /api/v1/*
+ * Montado en "/api/" => al proxy le llega "/public/..." etc
  */
 const apiProxy = makeProxy(API_ORIGIN, {
   pathRewrite: (p) => {
+    const base = ensureSlashStart(API_BASE); // "/api/v1"
     const path = ensureSlashStart(p);
-    const base = ensureSlashStart(API_BASE);
     if (path.startsWith(base)) return path;
     return `${removeTrailingSlash(base)}${path}`;
   },
 });
 
 /**
- * ✅ compat: /api/v1/* directo
+ * ✅ COMPAT: /api/v1/* directo
  */
 const apiV1CompatProxy = makeProxy(API_ORIGIN);
 
 /**
- * ✅ compat: /public/* directo
+ * ✅ COMPAT: /public/* directo
  */
 const publicCompatProxy = makeProxy(API_ORIGIN);
 
-/**
- * ✅ /app/* -> /shop/app/*
- */
-const appProxy = makeProxy(APP_UPSTREAM, {
-  pathRewrite: (p) => joinPrefix(APP_INDEX_PATH, p),
-});
-
-// ====================
-// 🔥 FIX CAPROVER: "/" devuelve 200 (y solo redirige si es browser)
-// ====================
+// ====== Root "/" (caprover friendly) ======
 app.get("/", (req, res) => {
   const accept = String(req.headers.accept || "");
   const ua = String(req.headers["user-agent"] || "");
@@ -187,58 +165,55 @@ app.get("/", (req, res) => {
   if (looksLikeBrowser) {
     return res.redirect(302, removeTrailingSlash(FRONTEND_INDEX_PATH) + "/");
   }
-
-  // para health checks / curl / caprover
-  res.status(200).send("OK");
+  return res.status(200).send("OK");
 });
 
+// ====== Redirects ======
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
-app.get("/app", (req, res) => res.redirect(301, "/app/"));
 
-// ====================
-// MOUNTS (ORDEN IMPORTA)
-// ====================
+// ✅ /app externo => redirige al backoffice real dentro del FE (/shop/app)
+app.get("/app", (req, res) => res.redirect(301, removeTrailingSlash(APP_INDEX_PATH) + "/"));
+app.use("/app/", (req, res) => {
+  // preserva el resto del path: /app/users -> /shop/app/users
+  const rest = req.originalUrl.replace(/^\/app/, ""); // incluye leading slash
+  return res.redirect(302, removeTrailingSlash(APP_INDEX_PATH) + rest);
+});
+
+// ====== ✅ MOUNTS (orden importa) ======
+
+// 1) assets vite bajo /shop
 app.use("/shop/assets/", shopAssetsFirstProxy);
+
+// 2) compat assets raíz
 app.use("/assets/", rootAssetsProxy);
 
+// 3) compat estáticos raíz
 app.get("/favicon.ico", rootStaticProxy);
 app.get("/robots.txt", rootStaticProxy);
 app.get("/manifest.webmanifest", rootStaticProxy);
 app.get("/manifest.json", rootStaticProxy);
 
+// 4) shop general (FIX 500: upstream sin /shop)
 app.use("/shop/", shopProxy);
 
+// 5) compat API para builds que llaman /api/v1
 app.use("/api/v1/", apiV1CompatProxy);
 app.use("/public/", publicCompatProxy);
+
+// 6) api “oficial” del edge (/api -> /api/v1)
 app.use("/api/", apiProxy);
 
-app.use("/app/", appProxy);
-
-// ====================
-// 404
-// ====================
+// ====== 404 edge ======
 app.use((req, res) => {
   res.setHeader("X-EDGE-HIT", "edge-404");
   res.status(404).json({ ok: false, error: "Not Found", path: req.originalUrl });
 });
 
-// ====================
-// Express error (último recurso)
-// ====================
-app.use((err, req, res, next) => {
-  console.error("❌ express error:", err && err.stack ? err.stack : err);
-  if (res.headersSent) return next(err);
-  res.status(500).json({ ok: false, error: "Edge Internal Error", path: req.originalUrl });
-});
-
-// ====================
-// Start
-// ====================
+// ====== Start ======
 app.listen(PORT, () => {
   console.log(`✅ pos360-edge listo en :${PORT}`);
   console.log(`shop -> ${SHOP_UPSTREAM}`);
   console.log(`api -> ${API_ORIGIN}${API_BASE}`);
-  console.log(`app -> ${APP_UPSTREAM} (mapped to ${APP_INDEX_PATH})`);
   console.log(`PUBLIC_BASE_URL -> ${PUBLIC_BASE_URL}`);
   console.log(`FRONTEND_INDEX_PATH -> ${FRONTEND_INDEX_PATH}`);
   console.log(`APP_INDEX_PATH -> ${APP_INDEX_PATH}`);
