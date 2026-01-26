@@ -1,6 +1,6 @@
 /**
  * ✅ pos360-edge/server.js
- * ✅ COPY-PASTE FINAL DEFINITIVO (OG real + cache-busting por version)
+ * ✅ COPY-PASTE FINAL DEFINITIVO (OG real + cache-busting PRO)
  *
  * Qué corrige:
  * - OG placeholders "__OG_TITLE__" etc: el EDGE los reemplaza para BOTS (Facebook/WhatsApp/Twitter/Telegram/Discord)
@@ -8,10 +8,11 @@
  * - Bug de assets: si el HTML viene con "/app/assets/" lo reescribe a "/shop/assets/" para rutas /shop/*
  * - Mantiene proxys: /shop, /shop/assets, /assets, /api, /api/v1, /public, /app (transparente a /shop/app)
  * - ✅ og-default.png: SIEMPRE 200 image/png y tamaño OG recomendado 1200x630
- * - ✅ OG de producto real: para /shop/product/:id consulta API pública y setea og:title/description/image reales
- * - ✅ Nivel 3 (pro): og:image con cache-busting estable: agrega ?v=<version> sacado del filename/timestamp
- *   Ej: .../1767045077180-fbd7623a.webp?v=1767045077180
- * - ✅ branch_id: respeta ?branch_id=3 en la URL del producto para buscar datos correctos
+ * - ✅ OG de producto real: /shop/product/:id => consulta API pública y setea og:title/description/image reales
+ * - ✅ Nivel 3 (PRO):
+ *    - og:image => ...?v=<timestamp> (derivado del filename)
+ *    - og:url   => ...?ogv=<timestamp>  🔥 (evita cache fantasma de WhatsApp/Meta por URL)
+ * - ✅ branch_id: respeta ?branch_id=3 en URL
  */
 
 const express = require("express");
@@ -82,7 +83,7 @@ app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_OG_PRODUCTS_VERSIONED_02");
+  res.setHeader("X-EDGE-BUILD", "EDGE_OG_PRODUCTS_VERSIONED_03_OGURL");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -320,13 +321,6 @@ function pickFirstImage(obj) {
   return "";
 }
 
-/**
- * ✅ Extrae una "version" estable para cache-busting desde la URL de imagen.
- * Casos típicos:
- * - .../1767045077180-fbd7623a.webp  => v=1767045077180
- * - .../111/1769444359050-xxxx.webp  => v=1769444359050
- * Si no encuentra timestamp: usa fallback "p<id>-b<branch>"
- */
 function deriveImageVersion(imageUrl, productId, branchId) {
   const u = String(imageUrl || "");
   const m = u.match(/\/(\d{10,})-[^\/]+\.(webp|jpg|jpeg|png)(\?.*)?$/i);
@@ -336,12 +330,15 @@ function deriveImageVersion(imageUrl, productId, branchId) {
   return `p${String(productId || "").trim() || "x"}-b${String(branchId || "").trim() || "x"}`;
 }
 
-function addVersionParam(url, version) {
+function addVersionParam(url, key, version) {
   if (!url) return url;
   const s = String(url);
   if (!version) return s;
-  if (/[?&]v=/.test(s)) return s; // ya tiene v=
-  return s.includes("?") ? `${s}&v=${encodeURIComponent(version)}` : `${s}?v=${encodeURIComponent(version)}`;
+  const re = new RegExp(`[?&]${key}=`, "i");
+  if (re.test(s)) return s;
+  return s.includes("?")
+    ? `${s}&${key}=${encodeURIComponent(version)}`
+    : `${s}?${key}=${encodeURIComponent(version)}`;
 }
 
 async function fetchJson(url, timeoutMs = 5000) {
@@ -391,7 +388,7 @@ async function fetchProductOg(productId, branchId) {
     if (!r.ok || !r.data) continue;
 
     const d = r.data;
-    let item =
+    const item =
       d.item ||
       d.product ||
       (Array.isArray(d.items) && d.items[0]) ||
@@ -425,29 +422,37 @@ async function fetchProductOg(productId, branchId) {
     const title = `${safeName} | ${OG_SITE_NAME}`;
     const desc = String(description || "").trim() || OG_DESCRIPTION_DEFAULT;
 
-    // ✅ Versionado de imagen (Nivel 3)
+    // ✅ Versionado imagen (v=...)
     const baseImg = imageAbs || OG_IMAGE_DEFAULT;
     const v = deriveImageVersion(baseImg, id, br);
-    const versionedImage = addVersionParam(baseImg, v);
+    const versionedImage = addVersionParam(baseImg, "v", v);
 
     return {
       ogTitle: title,
       ogDescription: desc,
       ogImage: versionedImage,
+      ogVersion: v, // ✅ la usamos para og:url (ogv=...)
     };
   }
 
   return null;
 }
 
-function replaceTokens(html, req, overrides = null) {
-  const baseUrl = `${PUBLIC_BASE_URL}${req.path}`;
-const version = overrides?.ogImage
-  ? (overrides.ogImage.match(/[?&]v=([^&]+)/)?.[1] || Date.now())
-  : Date.now();
-const fullUrl = `${baseUrl}?ogv=${version}`;
+function matchProductId(pathname) {
+  const m = String(pathname || "").match(/^\/shop\/product\/(\d+)(\/|$|\?)/i);
+  return m ? m[1] : null;
+}
 
-  const canonical = fullUrl;
+function replaceTokens(html, req, overrides = null) {
+  // ✅ og:url PRO: versionado para matar cache fantasma de WhatsApp/Meta
+  // - Para bots: og:url queda con ?ogv=<version>
+  // - Para humanos: NO cambia nada, esto solo se inyecta en HTML de bots
+  const baseOgUrl = `${PUBLIC_BASE_URL}${req.path}`; // sin query del usuario
+  const ogv = overrides?.ogVersion || Date.now().toString();
+  const fullOgUrl = addVersionParam(baseOgUrl, "ogv", ogv);
+
+  // canonical: mantenemos la URL real que el usuario ve (con query si existiera)
+  const canonical = `${PUBLIC_BASE_URL}${req.originalUrl}`;
 
   const ogTitle = overrides?.ogTitle || OG_TITLE_DEFAULT;
   const ogDescription = overrides?.ogDescription || OG_DESCRIPTION_DEFAULT;
@@ -461,7 +466,7 @@ const fullUrl = `${baseUrl}?ogv=${version}`;
     .replaceAll("__SITE_NAME__", OG_SITE_NAME)
     .replaceAll("__OG_TITLE__", ogTitle)
     .replaceAll("__OG_DESCRIPTION__", ogDescription)
-    .replaceAll("__OG_URL__", fullUrl)
+    .replaceAll("__OG_URL__", fullOgUrl) // ✅ acá el PRO
     .replaceAll("__OG_IMAGE__", ogImage)
     .replaceAll("__OG_IMAGE_ALT__", ogTitle);
 
@@ -494,11 +499,6 @@ async function fetchUpstreamHtml(pathname) {
   return { status: resp.status, contentType: ct, body: text };
 }
 
-function matchProductId(pathname) {
-  const m = String(pathname || "").match(/^\/shop\/product\/(\d+)(\/|$|\?)/i);
-  return m ? m[1] : null;
-}
-
 // Middleware que solo aplica a BOTS para /shop/*
 async function botOgMiddleware(req, res, next) {
   try {
@@ -525,9 +525,10 @@ async function botOgMiddleware(req, res, next) {
       return;
     }
 
-    // ✅ Si es producto, buscamos OG real con branch_id de la URL
     const pid = matchProductId(req.originalUrl);
-    const branchId = (req.query && req.query.branch_id ? String(req.query.branch_id) : "") || OG_BRANCH_ID;
+    const branchId =
+      (req.query && req.query.branch_id ? String(req.query.branch_id) : "") || OG_BRANCH_ID;
+
     const og = pid ? await fetchProductOg(pid, branchId) : null;
 
     const patched = replaceTokens(body, req, og);
