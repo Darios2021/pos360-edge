@@ -1,11 +1,16 @@
 /**
  * ✅ pos360-edge/server.js
- * ✅ COPY-PASTE FINAL DEFINITIVO (FIX ASSETS 404 + /shop + compat /assets)
+ * ✅ COPY-PASTE FINAL DEFINITIVO (FIX ASSETS 404 + /shop + compat /assets + compat /api/v1)
  *
  * FIX CLAVE:
  * - Vite genera <script src="/shop/assets/..."> y <link href="/shop/assets/...">
  * - Express cuando montás "/shop/assets/" entrega al proxy SOLO "/index-xxx.js"
  * - Entonces el rewrite debe RE-PREFIJAR "/assets" (no hacer replace de "/shop")
+ *
+ * FIX API CLAVE:
+ * - Tu frontend HOY está llamando "/api/v1/..." (según consola)
+ * - En edge sólo existía "/api/..." => 404
+ * - Solución: compat /api/v1/* (y opcional /public/*) hacia API_ORIGIN
  *
  * Rutas:
  *  - /health        -> 200
@@ -15,7 +20,9 @@
  *  - /shop/*        -> proxy a frontend (preserva /shop según tu diseño)
  *  - /assets/*      -> (compat) proxy a frontend como /assets/*
  *  - /favicon.ico   -> (compat) proxy a frontend como /favicon.ico
- *  - /api/*         -> proxy a API
+ *  - /api/*         -> proxy a API (rewrite a /api/v1/*)
+ *  - /api/v1/*      -> ✅ compat directo a API (builds que llaman /api/v1)
+ *  - /public/*      -> ✅ compat directo a API (por si alguna vez se usa)
  *  - /app/*         -> proxy a APP (si aplica)
  */
 
@@ -69,7 +76,7 @@ app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_ASSETS_FIRST_02");
+  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_ASSETS_FIRST_02_API_COMPAT_01");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -133,14 +140,30 @@ const rootStaticProxy = makeProxy(SHOP_UPSTREAM);
  * ✅ API proxy
  * /api/... -> /api/v1/...
  * si ya viene /api/v1 no lo duplica
+ *
+ * IMPORTANTE:
+ * - Montado en "/api/" => al proxy le llega "/public/..."
+ * - Por eso reinyectamos API_BASE
  */
 const apiProxy = makeProxy(API_ORIGIN, {
   pathRewrite: (path) => {
-    const base = ensureSlashStart(API_BASE);
+    const base = ensureSlashStart(API_BASE); // "/api/v1"
     if (path.startsWith(base)) return path;
     return `${removeTrailingSlash(base)}${ensureSlashStart(path)}`;
   },
 });
+
+/**
+ * ✅ COMPAT: /api/v1/* directo a la API
+ * - Montado en "/api/v1/" => al proxy le llega "/public/..."
+ * - Acá NO reescribimos (va tal cual, con el prefijo ya presente en el mount)
+ */
+const apiV1CompatProxy = makeProxy(API_ORIGIN);
+
+/**
+ * ✅ COMPAT: /public/* directo a la API (opcional, útil)
+ */
+const publicCompatProxy = makeProxy(API_ORIGIN);
 
 /**
  * ✅ APP proxy (si lo usás)
@@ -170,10 +193,14 @@ app.get("/manifest.json", rootStaticProxy);
 // ✅ 4) shop general (DESPUÉS)
 app.use("/shop/", shopProxy);
 
-// ✅ 5) api
+// ✅ 5) ✅ compat API PRIMERO (para tu build actual que llama /api/v1)
+app.use("/api/v1/", apiV1CompatProxy);
+app.use("/public/", publicCompatProxy);
+
+// ✅ 6) api “oficial” del edge (/api -> /api/v1)
 app.use("/api/", apiProxy);
 
-// ✅ 6) app/backoffice
+// ✅ 7) app/backoffice
 app.use("/app/", appProxy);
 
 // ====== 404 edge ======
