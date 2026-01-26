@@ -4,15 +4,15 @@
  *
  * FIX CLAVE:
  * - Vite genera <script src="/shop/assets/..."> y <link href="/shop/assets/...">
- * - Si /shop/assets cae en el handler HTML/branding o en rewrite errado -> 404 y pantalla blanca
- * - Solución: PROXY DIRECTO para /shop/assets/* ANTES del proxy general /shop/
+ * - Express cuando montás "/shop/assets/" entrega al proxy SOLO "/index-xxx.js"
+ * - Entonces el rewrite debe RE-PREFIJAR "/assets" (no hacer replace de "/shop")
  *
  * Rutas:
  *  - /health        -> 200
  *  - /              -> 301 /shop/
  *  - /shop          -> 301 /shop/
  *  - /shop/assets/* -> proxy a frontend como /assets/*
- *  - /shop/*        -> proxy a frontend PRESERVANDO /shop (reinyecta prefijo)
+ *  - /shop/*        -> proxy a frontend (preserva /shop según tu diseño)
  *  - /assets/*      -> (compat) proxy a frontend como /assets/*
  *  - /favicon.ico   -> (compat) proxy a frontend como /favicon.ico
  *  - /api/*         -> proxy a API
@@ -69,7 +69,7 @@ app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_ASSETS_FIRST_01");
+  res.setHeader("X-EDGE-BUILD", "EDGE_FIX_ASSETS_FIRST_02");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -98,11 +98,11 @@ function makeProxy(target, opts = {}) {
 
 /**
  * ✅ 1) SHOP ASSETS FIRST
- * /shop/assets/...  ->  /assets/...
- * (Esto es LO que te estaba rompiendo la pantalla blanca)
+ * Montado en "/shop/assets/" => al proxy le llega "/index-xxx.js"
+ * Necesitamos mandarlo al upstream como "/assets/index-xxx.js"
  */
 const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
-  pathRewrite: (path) => path.replace(/^\/shop/, ""), // "/shop/assets/x" -> "/assets/x"
+  pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
 });
 
 /**
@@ -116,9 +116,18 @@ const shopProxy = makeProxy(SHOP_UPSTREAM, {
 
 /**
  * ✅ Compat: si el build/algún HTML pide /assets/* en raíz
- * /assets/x -> /assets/x (proxy directo)
+ * Montado en "/assets/" => al proxy le llega "/index-xxx.js"
+ * Debe ir a "/assets/index-xxx.js"
  */
-const rootAssetsProxy = makeProxy(SHOP_UPSTREAM);
+const rootAssetsProxy = makeProxy(SHOP_UPSTREAM, {
+  pathRewrite: (p) => `/assets${ensureSlashStart(p)}`,
+});
+
+/**
+ * ✅ Compat: estáticos de raíz (favicon, robots, manifest)
+ * Acá NO queremos prefijar /assets, deben pasar tal cual.
+ */
+const rootStaticProxy = makeProxy(SHOP_UPSTREAM);
 
 /**
  * ✅ API proxy
@@ -153,10 +162,10 @@ app.use("/shop/assets/", shopAssetsFirstProxy);
 app.use("/assets/", rootAssetsProxy);
 
 // ✅ 3) compat estáticos típicos en raíz
-app.get("/favicon.ico", rootAssetsProxy);
-app.get("/robots.txt", rootAssetsProxy);
-app.get("/manifest.webmanifest", rootAssetsProxy);
-app.get("/manifest.json", rootAssetsProxy);
+app.get("/favicon.ico", rootStaticProxy);
+app.get("/robots.txt", rootStaticProxy);
+app.get("/manifest.webmanifest", rootStaticProxy);
+app.get("/manifest.json", rootStaticProxy);
 
 // ✅ 4) shop general (DESPUÉS)
 app.use("/shop/", shopProxy);
