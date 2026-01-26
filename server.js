@@ -91,11 +91,15 @@ app.get("/health", (req, res) => {
 });
 
 // ====== ✅ OG DEFAULT PNG (ANTES DE TODO) ======
-// Facebook exige que og:image sea accesible y con Content-Type correcto.
-// - Si existe local => lo sirve como image/png.
-// - Si no existe local => fallback proxy al SHOP_UPSTREAM (por si el FE lo tiene).
-app.get("/og-default.png", async (req, res, next) => {
+// - Si existe public/og-default.png => lo sirve
+// - Si NO existe => devuelve un PNG mínimo válido 1x1 (Facebook debería aceptarlo si ve image/png real)
+app.get("/og-default.png", async (req, res) => {
+  // PNG 1x1 transparente (válido)
+  const PNG_1x1_TRANSPARENT_BASE64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIW2P4//8/AwAI/AL+X8nG5QAAAABJRU5ErkJggg==";
+
   try {
+    // 1) archivo local
     if (fs.existsSync(OG_DEFAULT_FILE)) {
       res.setHeader("Content-Type", "image/png");
       res.setHeader("Cache-Control", "public, max-age=86400");
@@ -103,37 +107,48 @@ app.get("/og-default.png", async (req, res, next) => {
       return res.sendFile(OG_DEFAULT_FILE);
     }
 
-    // Fallback: intentar fetch al upstream (por si está en public del FE)
-    const url = `${removeTrailingSlash(SHOP_UPSTREAM)}/og-default.png`;
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 6000);
+    // 2) upstream (si el FE lo tiene)
+    const upstreamUrl = `${removeTrailingSlash(SHOP_UPSTREAM)}/og-default.png`;
 
-    const resp = await fetch(url, { method: "GET", signal: controller.signal }).finally(() =>
-      clearTimeout(t)
-    );
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 5000);
 
-    const buf = Buffer.from(await resp.arrayBuffer());
-    const ct = String(resp.headers.get("content-type") || "");
+      const resp = await fetch(upstreamUrl, { method: "GET", signal: controller.signal }).finally(
+        () => clearTimeout(t)
+      );
 
-    if (resp.ok && ct.toLowerCase().includes("image/")) {
-      res.status(200);
-      res.setHeader("Content-Type", ct || "image/png");
-      res.setHeader("Cache-Control", "public, max-age=86400");
-      res.setHeader("X-EDGE-HIT", "og-default-upstream");
-      return res.send(buf);
+      const ct = String(resp.headers.get("content-type") || "").toLowerCase();
+      if (resp.ok && ct.includes("image/")) {
+        const buf = Buffer.from(await resp.arrayBuffer());
+        res.status(200);
+        res.setHeader("Content-Type", ct || "image/png");
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        res.setHeader("X-EDGE-HIT", "og-default-upstream");
+        return res.send(buf);
+      }
+    } catch (_) {
+      // ignore y caemos al generado
     }
 
-    res.setHeader("X-EDGE-HIT", "og-default-missing");
-    return res.status(404).json({
-      ok: false,
-      error: "og-default.png not found",
-      hint: "Add pos360-edge/public/og-default.png or ensure frontend serves /og-default.png as image/*",
-    });
+    // 3) generado (siempre 200 + image/png)
+    const buf = Buffer.from(PNG_1x1_TRANSPARENT_BASE64, "base64");
+    res.status(200);
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.setHeader("X-EDGE-HIT", "og-default-generated");
+    return res.send(buf);
   } catch (e) {
-    console.error("❌ /og-default.png error:", e && e.message ? e.message : e);
-    next();
+    const buf = Buffer.from(PNG_1x1_TRANSPARENT_BASE64, "base64");
+    res.status(200);
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.setHeader("X-EDGE-HIT", "og-default-generated");
+    return res.send(buf);
   }
 });
+
+
 
 // ====== Helpers: proxy builder ======
 function makeProxy(target, opts = {}) {
