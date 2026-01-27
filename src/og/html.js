@@ -1,5 +1,10 @@
 /**
  * src/og/html.js
+ * ✅ COPY-PASTE FINAL
+ * - Detecta bots
+ * - Reemplaza tokens OG
+ * - Inyecta fb:app_id
+ * - FIX: elimina og:image:width/height (WhatsApp descarta si no coincide con la imagen real)
  */
 
 const {
@@ -10,6 +15,7 @@ const {
   OG_IMAGE_DEFAULT,
   PUBLIC_BASE_URL,
   FRONTEND_INDEX_PATH,
+  OG_PRICE_CURRENCY_DEFAULT,
 } = require("../config");
 
 const { joinPrefix, removeTrailingSlash } = require("../utils/path");
@@ -51,8 +57,20 @@ function injectFbAppId(html) {
   return html.replace("</head>", `${meta}</head>`);
 }
 
+/**
+ * ✅ WhatsApp puede ignorar og:image si width/height no coincide con la imagen real
+ * -> eliminamos esas metas para evitar mismatch.
+ */
+function stripOgImageSizeMeta(html) {
+  if (!html) return html;
+
+  // elimina <meta property="og:image:width" ...> y height (comillas simples o dobles)
+  return html
+    .replace(/<meta[^>]+property=['"]og:image:width['"][^>]*>\s*/gi, "")
+    .replace(/<meta[^>]+property=['"]og:image:height['"][^>]*>\s*/gi, "");
+}
+
 function replaceTokens(html, req, overrides = null) {
-  // middleware montado en "/shop/" => req.path NO incluye "/shop"
   const publicPathWithShop = joinPrefix(FRONTEND_INDEX_PATH, req.path);
   const baseOgUrl = `${PUBLIC_BASE_URL}${removeTrailingSlash(publicPathWithShop)}`;
 
@@ -87,14 +105,18 @@ function replaceTokens(html, req, overrides = null) {
 
   out = injectFbAppId(out);
 
-  // meta de precio
+  // meta de precio (si hay)
   if (overrides?.price) {
-    const currency = String(overrides.currency || "ARS");
     const priceMeta =
       `\n    <meta property="product:price:amount" content="${String(overrides.price)}" />` +
-      `\n    <meta property="product:price:currency" content="${currency}" />\n`;
+      `\n    <meta property="product:price:currency" content="${String(
+        overrides.currency || OG_PRICE_CURRENCY_DEFAULT
+      )}" />\n`;
     out = out.replace("</head>", `${priceMeta}</head>`);
   }
+
+  // ✅ CLAVE: evitamos que WA descarte og:image por mismatch de size
+  out = stripOgImageSizeMeta(out);
 
   return out;
 }
