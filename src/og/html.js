@@ -5,6 +5,7 @@
  * - Reemplaza tokens OG
  * - Inyecta fb:app_id
  * - FIX: elimina og:image:width/height (WhatsApp descarta si no coincide con la imagen real)
+ * - ✅ NUEVO: inyecta favicon links (para Chrome/preview clientes)
  */
 
 const {
@@ -16,6 +17,8 @@ const {
   PUBLIC_BASE_URL,
   FRONTEND_INDEX_PATH,
   OG_PRICE_CURRENCY_DEFAULT,
+  // ✅ opcional (si no lo tenés, no pasa nada)
+  FAVICON_DEFAULT,
 } = require("../config");
 
 const { joinPrefix, removeTrailingSlash } = require("../utils/path");
@@ -63,11 +66,37 @@ function injectFbAppId(html) {
  */
 function stripOgImageSizeMeta(html) {
   if (!html) return html;
-
-  // elimina <meta property="og:image:width" ...> y height (comillas simples o dobles)
   return html
     .replace(/<meta[^>]+property=['"]og:image:width['"][^>]*>\s*/gi, "")
     .replace(/<meta[^>]+property=['"]og:image:height['"][^>]*>\s*/gi, "");
+}
+
+/**
+ * ✅ NUEVO: Inyecta favicon links en <head>
+ * - Usa overrides.faviconUrl si existe, sino FAVICON_DEFAULT, sino deja como está.
+ * - Agrega cache-busting ?v=
+ */
+function injectFaviconLinks(html, faviconUrl, version) {
+  if (!html) return html;
+
+  const fav = String(faviconUrl || "").trim();
+  if (!fav) return html;
+
+  const v = String(version || "").trim() || Date.now().toString();
+  const favV = addVersionParam(fav, "v", v);
+
+  // si ya hay rel="icon" dejamos el primero pero lo “refrescamos” insertando antes
+  const block =
+    `\n    <!-- EDGE favicon injected -->` +
+    `\n    <link rel="icon" href="${favV}" />` +
+    `\n    <link rel="shortcut icon" href="${favV}" />` +
+    `\n    <link rel="apple-touch-icon" href="${favV}" />` +
+    `\n`;
+
+  if (html.includes("</head>")) {
+    return html.replace("</head>", `${block}</head>`);
+  }
+  return html;
 }
 
 function replaceTokens(html, req, overrides = null) {
@@ -117,6 +146,10 @@ function replaceTokens(html, req, overrides = null) {
 
   // ✅ CLAVE: evitamos que WA descarte og:image por mismatch de size
   out = stripOgImageSizeMeta(out);
+
+  // ✅ NUEVO: favicon
+  const fav = overrides?.faviconUrl || FAVICON_DEFAULT || "";
+  out = injectFaviconLinks(out, fav, overrides?.faviconVersion || ogv);
 
   return out;
 }
