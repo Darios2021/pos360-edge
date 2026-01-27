@@ -1,11 +1,11 @@
 /**
  * src/og/html.js
- * ✅ COPY-PASTE FINAL
+ * ✅ COPY-PASTE FINAL (FULL)
  * - Detecta bots
  * - Reemplaza tokens OG
  * - Inyecta fb:app_id
  * - FIX: elimina og:image:width/height (WhatsApp descarta si no coincide con la imagen real)
- * - ✅ NUEVO: inyecta favicon links (para Chrome/preview clientes)
+ * - ✅ NUEVO: reemplaza __FAVICON__ + inyecta favicon links (para Chrome/preview clientes)
  */
 
 const {
@@ -17,7 +17,7 @@ const {
   PUBLIC_BASE_URL,
   FRONTEND_INDEX_PATH,
   OG_PRICE_CURRENCY_DEFAULT,
-  // ✅ opcional (si no lo tenés, no pasa nada)
+  // ✅ opcional
   FAVICON_DEFAULT,
 } = require("../config");
 
@@ -72,9 +72,26 @@ function stripOgImageSizeMeta(html) {
 }
 
 /**
+ * ✅ NUEVO: Reemplaza placeholders de favicon si existen
+ * - __FAVICON__ en href de icon/apple-touch-icon
+ */
+function replaceFaviconToken(html, faviconUrl, version) {
+  if (!html) return html;
+
+  const fav = String(faviconUrl || "").trim();
+  if (!fav) return html;
+
+  const v = String(version || "").trim() || Date.now().toString();
+  const favV = addVersionParam(fav, "v", v);
+
+  // reemplaza literal __FAVICON__ donde aparezca
+  return html.replaceAll("__FAVICON__", favV);
+}
+
+/**
  * ✅ NUEVO: Inyecta favicon links en <head>
- * - Usa overrides.faviconUrl si existe, sino FAVICON_DEFAULT, sino deja como está.
- * - Agrega cache-busting ?v=
+ * - Inserta un bloque antes de </head> para “pisar” cache de browsers/clients.
+ * - Usa ?v= para cache-busting.
  */
 function injectFaviconLinks(html, faviconUrl, version) {
   if (!html) return html;
@@ -85,10 +102,9 @@ function injectFaviconLinks(html, faviconUrl, version) {
   const v = String(version || "").trim() || Date.now().toString();
   const favV = addVersionParam(fav, "v", v);
 
-  // si ya hay rel="icon" dejamos el primero pero lo “refrescamos” insertando antes
   const block =
     `\n    <!-- EDGE favicon injected -->` +
-    `\n    <link rel="icon" href="${favV}" />` +
+    `\n    <link rel="icon" type="image/png" href="${favV}" />` +
     `\n    <link rel="shortcut icon" href="${favV}" />` +
     `\n    <link rel="apple-touch-icon" href="${favV}" />` +
     `\n`;
@@ -147,9 +163,12 @@ function replaceTokens(html, req, overrides = null) {
   // ✅ CLAVE: evitamos que WA descarte og:image por mismatch de size
   out = stripOgImageSizeMeta(out);
 
-  // ✅ NUEVO: favicon
+  // ✅ NUEVO: favicon token + injection
   const fav = overrides?.faviconUrl || FAVICON_DEFAULT || "";
-  out = injectFaviconLinks(out, fav, overrides?.faviconVersion || ogv);
+  const favVersion = overrides?.faviconVersion || ogv;
+
+  out = replaceFaviconToken(out, fav, favVersion);
+  out = injectFaviconLinks(out, fav, favVersion);
 
   return out;
 }
