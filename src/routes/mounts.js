@@ -1,11 +1,15 @@
 /**
  * src/routes/mounts.js
- * Monta health + og-default + redirects + proxys con el ORDEN correcto
+ * ✅ COPY-PASTE FINAL COMPLETO
+ * Monta health + og-default + redirects + favicon same-origin + proxys con ORDEN correcto
  */
 
 const { botOgMiddleware } = require("../og/botMiddleware");
 const { registerOgDefaultRoute } = require("./ogDefault.route");
 const { registerRedirectRoutes } = require("./redirects.route");
+
+const faviconRoutes = require("./favicon.route");
+
 const {
   shopAssetsFirstProxy,
   rootAssetsProxy,
@@ -36,13 +40,19 @@ function registerMounts(app) {
   // Redirects base
   registerRedirectRoutes(app);
 
+  // ✅ Favicon same-origin (ANTES de /shop bot middleware y proxys)
+  // Maneja:
+  // - GET /favicon.ico
+  // - GET /apple-touch-icon.png
+  app.use(faviconRoutes);
+
   // ====== ✅ MOUNTS (ORDEN IMPORTA) ======
   app.use("/shop/", botOgMiddleware);
 
   app.use("/shop/assets/", shopAssetsFirstProxy);
   app.use("/assets/", rootAssetsProxy);
 
-  app.get("/favicon.ico", rootStaticProxy);
+  // ✅ estos sí pueden seguir yendo al frontend
   app.get("/robots.txt", rootStaticProxy);
   app.get("/manifest.webmanifest", rootStaticProxy);
   app.get("/manifest.json", rootStaticProxy);
