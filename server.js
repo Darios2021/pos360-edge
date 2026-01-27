@@ -1,6 +1,6 @@
 /**
  * ✅ pos360-edge/server.js
- * ✅ COPY-PASTE FINAL DEFINITIVO (OG real + cache-busting PRO)
+ * ✅ COPY-PASTE FINAL DEFINITIVO (OG real + cache-busting PRO + precio opcional)
  *
  * Qué corrige:
  * - OG placeholders "__OG_TITLE__" etc: el EDGE los reemplaza para BOTS (Facebook/WhatsApp/Twitter/Telegram/Discord)
@@ -11,8 +11,11 @@
  * - ✅ OG de producto real: /shop/product/:id => consulta API pública y setea og:title/description/image reales
  * - ✅ Nivel 3 (PRO):
  *    - og:image => ...?v=<timestamp> (derivado del filename)
- *    - og:url   => ...?ogv=<timestamp>  🔥 (evita cache fantasma de WhatsApp/Meta por URL)
+ *    - og:url   => .../shop/... ?ogv=<timestamp>  🔥 (evita cache fantasma de WhatsApp/Meta por URL)
  * - ✅ branch_id: respeta ?branch_id=3 en URL
+ * - ✅ Precio opcional:
+ *    - inyecta product:price:amount + product:price:currency si la API devuelve precio
+ *    - opcional: OG_TITLE_INCLUDE_PRICE=1 => agrega “$xxxx” al og:title (WhatsApp lo muestra SIEMPRE)
  */
 
 const express = require("express");
@@ -37,11 +40,11 @@ function ensureSlashStart(p) {
 function removeTrailingSlash(p) {
   return p.length > 1 && p.endsWith("/") ? p.slice(0, -1) : p;
 }
-function joinPrefix(prefix, path) {
+function joinPrefix(prefix, pth) {
   const pfx = removeTrailingSlash(ensureSlashStart(prefix));
-  const pth = ensureSlashStart(path);
-  if (pth === "/") return `${pfx}/`;
-  return `${pfx}${pth}`;
+  const p = ensureSlashStart(pth);
+  if (p === "/") return `${pfx}/`;
+  return `${pfx}${p}`;
 }
 
 const PORT = parseInt(env("PORT", "3000"), 10) || 3000;
@@ -74,6 +77,12 @@ const FB_APP_ID = env("FB_APP_ID", "");
 // Branch default (si no viene en query)
 const OG_BRANCH_ID = env("OG_BRANCH_ID", "3");
 
+// ✅ Si querés que WhatsApp muestre precio sí o sí:
+const OG_TITLE_INCLUDE_PRICE = env("OG_TITLE_INCLUDE_PRICE", "0") === "1";
+
+// ✅ Moneda por defecto si API no trae
+const OG_PRICE_CURRENCY_DEFAULT = env("OG_PRICE_CURRENCY_DEFAULT", "ARS");
+
 // ✅ Ruta local del PNG opcional (si existiera, se usa)
 const OG_DEFAULT_FILE = path.join(__dirname, "public", "og-default.png");
 
@@ -83,7 +92,7 @@ app.enable("strict routing");
 
 // ====== Health ======
 app.get("/health", (req, res) => {
-  res.setHeader("X-EDGE-BUILD", "EDGE_OG_PRODUCTS_VERSIONED_03_OGURL");
+  res.setHeader("X-EDGE-BUILD", "EDGE_OG_PRODUCTS_VERSIONED_04_OGURL_PRICE");
   res.json({
     ok: true,
     edge: "pos360-edge",
@@ -341,6 +350,15 @@ function addVersionParam(url, key, version) {
     : `${s}?${key}=${encodeURIComponent(version)}`;
 }
 
+function normalizePrice(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v).trim();
+  if (!s) return "";
+  // si viene "14.100,00" o "14100.00" lo dejamos simple
+  const clean = s.replace(/\s/g, "");
+  return clean;
+}
+
 async function fetchJson(url, timeoutMs = 5000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -419,7 +437,27 @@ async function fetchProductOg(productId, branchId) {
     const safeName = String(name || "").trim();
     if (!safeName) continue;
 
-    const title = `${safeName} | ${OG_SITE_NAME}`;
+    // ✅ precio (si la API lo trae)
+    const rawPrice =
+      item.price ??
+      item.price_final ??
+      item.price_list ??
+      item.price_discount ??
+      item.amount ??
+      "";
+
+    const price = normalizePrice(rawPrice);
+    const currency =
+      (item.currency || item.price_currency || item.currency_code || "").toString().trim() ||
+      OG_PRICE_CURRENCY_DEFAULT;
+
+    // ✅ title/desc
+    let titleBase = `${safeName} | ${OG_SITE_NAME}`;
+    if (OG_TITLE_INCLUDE_PRICE && price) {
+      // WhatsApp lo muestra siempre
+      titleBase = `${safeName} - $${price} | ${OG_SITE_NAME}`;
+    }
+
     const desc = String(description || "").trim() || OG_DESCRIPTION_DEFAULT;
 
     // ✅ Versionado imagen (v=...)
@@ -428,10 +466,12 @@ async function fetchProductOg(productId, branchId) {
     const versionedImage = addVersionParam(baseImg, "v", v);
 
     return {
-      ogTitle: title,
+      ogTitle: titleBase,
       ogDescription: desc,
       ogImage: versionedImage,
       ogVersion: v, // ✅ la usamos para og:url (ogv=...)
+      price: price,
+      currency: currency,
     };
   }
 
@@ -444,14 +484,17 @@ function matchProductId(pathname) {
 }
 
 function replaceTokens(html, req, overrides = null) {
+  // ✅ FIX CLAVE:
+  // botOgMiddleware está montado en "/shop/" => req.path NO incluye "/shop"
+  // Por eso reinyectamos FRONTEND_INDEX_PATH para construir og:url correcto:
+  const publicPathWithShop = joinPrefix(FRONTEND_INDEX_PATH, req.path); // "/shop" + "/product/309"
+  const baseOgUrl = `${PUBLIC_BASE_URL}${removeTrailingSlash(publicPathWithShop)}`;
+
   // ✅ og:url PRO: versionado para matar cache fantasma de WhatsApp/Meta
-  // - Para bots: og:url queda con ?ogv=<version>
-  // - Para humanos: NO cambia nada, esto solo se inyecta en HTML de bots
-  const baseOgUrl = `${PUBLIC_BASE_URL}${req.path}`; // sin query del usuario
   const ogv = overrides?.ogVersion || Date.now().toString();
   const fullOgUrl = addVersionParam(baseOgUrl, "ogv", ogv);
 
-  // canonical: mantenemos la URL real que el usuario ve (con query si existiera)
+  // canonical: URL real visible por usuario (con query)
   const canonical = `${PUBLIC_BASE_URL}${req.originalUrl}`;
 
   const ogTitle = overrides?.ogTitle || OG_TITLE_DEFAULT;
@@ -466,10 +509,11 @@ function replaceTokens(html, req, overrides = null) {
     .replaceAll("__SITE_NAME__", OG_SITE_NAME)
     .replaceAll("__OG_TITLE__", ogTitle)
     .replaceAll("__OG_DESCRIPTION__", ogDescription)
-    .replaceAll("__OG_URL__", fullOgUrl) // ✅ acá el PRO
+    .replaceAll("__OG_URL__", fullOgUrl)
     .replaceAll("__OG_IMAGE__", ogImage)
     .replaceAll("__OG_IMAGE_ALT__", ogTitle);
 
+  // ✅ Fix assets mismatch: si el HTML vino con /app/assets para una URL /shop/*
   if (req.originalUrl.startsWith("/shop/")) {
     out = out
       .replaceAll('src="/app/assets/', 'src="/shop/assets/')
@@ -478,7 +522,19 @@ function replaceTokens(html, req, overrides = null) {
       .replaceAll("href='/app/assets/", "href='/shop/assets/");
   }
 
+  // ✅ Inyecta fb:app_id
   out = injectFbAppId(out);
+
+  // ✅ Inyecta meta de precio (Facebook lo entiende; WhatsApp depende)
+  if (overrides?.price) {
+    const priceMeta =
+      `\n    <meta property="product:price:amount" content="${String(overrides.price)}" />` +
+      `\n    <meta property="product:price:currency" content="${String(
+        overrides.currency || OG_PRICE_CURRENCY_DEFAULT
+      )}" />\n`;
+    out = out.replace("</head>", `${priceMeta}</head>`);
+  }
+
   return out;
 }
 
@@ -517,6 +573,7 @@ async function botOgMiddleware(req, res, next) {
       return next();
     }
 
+    // ✅ Pedimos HTML al upstream usando prefijo /shop
     const upstreamPath = joinPrefix(FRONTEND_INDEX_PATH, req.path);
     const { status, contentType, body } = await fetchUpstreamHtml(upstreamPath);
 
@@ -552,11 +609,11 @@ const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
 });
 
 const shopProxy = makeProxy(SHOP_UPSTREAM, {
-  pathRewrite: (path) => joinPrefix(FRONTEND_INDEX_PATH, path),
+  pathRewrite: (p) => joinPrefix(FRONTEND_INDEX_PATH, p),
 });
 
 const appProxy = makeProxy(SHOP_UPSTREAM, {
-  pathRewrite: (path) => joinPrefix(APP_INDEX_PATH, path),
+  pathRewrite: (p) => joinPrefix(APP_INDEX_PATH, p),
 });
 
 const rootAssetsProxy = makeProxy(SHOP_UPSTREAM, {
@@ -566,10 +623,10 @@ const rootAssetsProxy = makeProxy(SHOP_UPSTREAM, {
 const rootStaticProxy = makeProxy(SHOP_UPSTREAM);
 
 const apiProxy = makeProxy(API_ORIGIN, {
-  pathRewrite: (path) => {
+  pathRewrite: (p) => {
     const base = ensureSlashStart(API_BASE);
-    if (path.startsWith(base)) return path;
-    return `${removeTrailingSlash(base)}${ensureSlashStart(path)}`;
+    if (p.startsWith(base)) return p;
+    return `${removeTrailingSlash(base)}${ensureSlashStart(p)}`;
   },
 });
 
@@ -577,9 +634,7 @@ const apiV1CompatProxy = makeProxy(API_ORIGIN);
 const publicCompatProxy = makeProxy(API_ORIGIN);
 
 // ====== Redirects base ======
-app.get("/", (req, res) =>
-  res.redirect(301, removeTrailingSlash(FRONTEND_INDEX_PATH) + "/")
-);
+app.get("/", (req, res) => res.redirect(301, removeTrailingSlash(FRONTEND_INDEX_PATH) + "/"));
 app.get("/shop", (req, res) => res.redirect(301, "/shop/"));
 app.get("/app", (req, res) => res.redirect(301, "/app/"));
 
@@ -621,5 +676,6 @@ app.listen(PORT, () => {
   console.log(`APP_INDEX_PATH -> ${APP_INDEX_PATH}`);
   console.log(`FB_APP_ID -> ${FB_APP_ID ? "SET" : "NOT_SET"}`);
   console.log(`OG_BRANCH_ID -> ${OG_BRANCH_ID}`);
+  console.log(`OG_TITLE_INCLUDE_PRICE -> ${OG_TITLE_INCLUDE_PRICE ? "1" : "0"}`);
   console.log(`OG_DEFAULT_FILE -> ${OG_DEFAULT_FILE}`);
 });
