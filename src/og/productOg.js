@@ -1,5 +1,8 @@
 /**
  * src/og/productOg.js
+ * ✅ COPY-PASTE FINAL
+ * - Elige precio válido (>0) evitando "0.00"
+ * - Formatea ARS para og:title cuando OG_TITLE_INCLUDE_PRICE=1
  */
 
 const {
@@ -69,21 +72,109 @@ function addVersionParam(url, key, version) {
   if (!version) return s;
   const re = new RegExp(`[?&]${key}=`, "i");
   if (re.test(s)) return s;
-  return s.includes("?") ? `${s}&${key}=${encodeURIComponent(version)}` : `${s}?${key}=${encodeURIComponent(version)}`;
+  return s.includes("?")
+    ? `${s}&${key}=${encodeURIComponent(version)}`
+    : `${s}?${key}=${encodeURIComponent(version)}`;
 }
 
-function normalizePrice(v) {
-  if (v === null || v === undefined) return "";
-  const s = String(v).trim();
-  if (!s) return "";
-  return s.replace(/\s/g, "");
+/**
+ * Convierte strings tipo:
+ * - "14.100,00" -> 14100
+ * - "14100.00"  -> 14100
+ * - 14100       -> 14100
+ */
+function moneyToNumber(v) {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === "number") return isFinite(v) ? v : 0;
+
+  const s0 = String(v).trim();
+  if (!s0) return 0;
+
+  // limpia espacios
+  let s = s0.replace(/\s/g, "");
+
+  // Si tiene coma decimal (latam): "14.100,00"
+  // -> sacamos miles "." y cambiamos "," por "."
+  if (s.includes(",") && !s.includes(".")) {
+    // "14100,00" => "14100.00"
+    s = s.replace(",", ".");
+  } else if (s.includes(",") && s.includes(".")) {
+    // "14.100,00" => "14100.00"
+    s = s.replace(/\./g, "").replace(",", ".");
+  }
+
+  // ahora parse float
+  const n = parseFloat(s);
+  return isFinite(n) ? n : 0;
+}
+
+function formatMoneyForTitle(n, currency) {
+  const num = typeof n === "number" ? n : moneyToNumber(n);
+  if (!(num > 0)) return "";
+
+  // Para ARS: sin decimales, miles con punto (es-AR)
+  if ((currency || "").toUpperCase() === "ARS") {
+    try {
+      return new Intl.NumberFormat("es-AR", { maximumFractionDigits: 0 }).format(num);
+    } catch (_) {
+      // fallback simple
+      return String(Math.round(num));
+    }
+  }
+
+  // para otras monedas: 2 decimales
+  try {
+    return new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(num);
+  } catch (_) {
+    return String(num);
+  }
+}
+
+function pickFirstValidPrice(item) {
+  // Prioridad: descuento/final > price > list > amount
+  const candidates = [
+    item.price_discount,
+    item.price_final,
+    item.price,
+    item.price_list,
+    item.amount,
+    item.total,
+  ];
+
+  for (const c of candidates) {
+    const n = moneyToNumber(c);
+    if (n > 0) return n;
+  }
+
+  // si viene en un objeto tipo { value: ... }
+  if (item && typeof item === "object") {
+    const extra = [
+      item.final_price,
+      item.sale_price,
+      item.list_price,
+      item.precio,
+      item.precio_final,
+      item.precio_lista,
+      item.precio_descuento,
+    ];
+    for (const c of extra) {
+      const n = moneyToNumber(c);
+      if (n > 0) return n;
+    }
+  }
+
+  return 0;
 }
 
 async function fetchJson(url, timeoutMs = 5000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetch(url, { method: "GET", headers: { Accept: "application/json" }, signal: controller.signal });
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
     const text = await resp.text();
     if (!resp.ok) return { ok: false, status: resp.status, data: null, text };
     let data = null;
@@ -123,13 +214,29 @@ async function fetchProductOg(productId, branchId) {
 
     const d = r.data;
     const item =
-      d.item || d.product || (Array.isArray(d.items) && d.items[0]) || (Array.isArray(d.data) && d.data[0]) || d;
+      d.item ||
+      d.product ||
+      (Array.isArray(d.items) && d.items[0]) ||
+      (Array.isArray(d.data) && d.data[0]) ||
+      d;
 
     if (!item || typeof item !== "object") continue;
 
-    const name = item.name || item.title || item.product_name || item.productTitle || item.nombre || "";
+    const name =
+      item.name ||
+      item.title ||
+      item.product_name ||
+      item.productTitle ||
+      item.nombre ||
+      "";
+
     const description =
-      item.description || item.desc || item.short_description || item.shortDescription || item.descripcion || "";
+      item.description ||
+      item.desc ||
+      item.short_description ||
+      item.shortDescription ||
+      item.descripcion ||
+      "";
 
     const img = pickFirstImage(item);
     const imageAbs = img ? absolutizeUrl(img) : "";
@@ -137,18 +244,24 @@ async function fetchProductOg(productId, branchId) {
     const safeName = String(name || "").trim();
     if (!safeName) continue;
 
-    const rawPrice =
-      item.price ?? item.price_final ?? item.price_list ?? item.price_discount ?? item.amount ?? "";
-
-    const price = normalizePrice(rawPrice);
+    // ✅ Moneda
     const currency =
-      (item.currency || item.price_currency || item.currency_code || "").toString().trim() || OG_PRICE_CURRENCY_DEFAULT;
+      (item.currency || item.price_currency || item.currency_code || "").toString().trim() ||
+      OG_PRICE_CURRENCY_DEFAULT;
 
+    // ✅ Precio “usable”
+    const priceNumber = pickFirstValidPrice(item);
+    const priceForTitle = formatMoneyForTitle(priceNumber, currency);
+
+    // ✅ Title/desc
     let titleBase = `${safeName} | ${OG_SITE_NAME}`;
-    if (OG_TITLE_INCLUDE_PRICE && price) titleBase = `${safeName} - $${price} | ${OG_SITE_NAME}`;
+    if (OG_TITLE_INCLUDE_PRICE && priceNumber > 0 && priceForTitle) {
+      titleBase = `${safeName} - $${priceForTitle} | ${OG_SITE_NAME}`;
+    }
 
     const desc = String(description || "").trim() || OG_DESCRIPTION_DEFAULT;
 
+    // ✅ Versionado imagen (v=...)
     const baseImg = imageAbs || OG_IMAGE_DEFAULT;
     const v = deriveImageVersion(baseImg, id, br);
     const versionedImage = addVersionParam(baseImg, "v", v);
@@ -158,8 +271,9 @@ async function fetchProductOg(productId, branchId) {
       ogDescription: desc,
       ogImage: versionedImage,
       ogVersion: v,
-      price,
-      currency,
+      // guardamos raw también
+      price: priceNumber > 0 ? String(priceNumber) : "",
+      currency: currency,
     };
   }
 
@@ -169,7 +283,6 @@ async function fetchProductOg(productId, branchId) {
 module.exports = {
   fetchProductOg,
   addVersionParam,
-  normalizePrice,
   absolutizeUrl,
   pickFirstImage,
   deriveImageVersion,
