@@ -230,14 +230,6 @@ async function fetchProductOg(productId, branchId) {
       item.nombre ||
       "";
 
-    const description =
-      item.description ||
-      item.desc ||
-      item.short_description ||
-      item.shortDescription ||
-      item.descripcion ||
-      "";
-
     const img = pickFirstImage(item);
     const imageAbs = img ? absolutizeUrl(img) : "";
 
@@ -259,7 +251,17 @@ async function fetchProductOg(productId, branchId) {
       titleBase = `${safeName} - $${priceForTitle} | ${OG_SITE_NAME}`;
     }
 
-    const desc = String(description || "").trim() || OG_DESCRIPTION_DEFAULT;
+    // ✅ Description CORTA estilo ML: solo marca + condición.
+    // No usamos la descripción larga del producto porque ocupa
+    // 3 renglones en WhatsApp y se ve mal. El precio ya está en
+    // el title.
+    const brand = String(item.brand || item.brand_name || item.marca || "").trim();
+    const condRaw = String(item.condition || item.condicion || "Nuevo").trim();
+    const cond = /usado/i.test(condRaw) ? "Usado" : "Nuevo";
+    const descParts = [];
+    if (brand) descParts.push(brand);
+    descParts.push(cond);
+    const desc = descParts.join(" · ");
 
     // ✅ Versionado imagen (v=...)
     const baseImg = imageAbs || OG_IMAGE_DEFAULT;

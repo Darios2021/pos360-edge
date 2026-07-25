@@ -173,9 +173,29 @@ function replaceTokens(html, req, overrides = null) {
   return out;
 }
 
+/**
+ * Extrae el id numérico del producto desde la URL del shop. Acepta
+ * tanto el id pelado como las URLs SEO-friendly con slug:
+ *   /shop/product/281                                  → 281
+ *   /shop/product/281?branch_id=3                      → 281
+ *   /shop/product/parlante-xiaomi-281                  → 281
+ *   /shop/product/celular-xiaomi-poco-x7-pro-...-462   → 462
+ *
+ * Convención: el id SIEMPRE va al final del path, separado por guion.
+ * Tomamos el último número precedido por guion en el path; si no hay,
+ * y el path es solo dígitos, devolvemos esos dígitos.
+ */
 function matchProductId(pathname) {
-  const m = String(pathname || "").match(/^\/shop\/product\/(\d+)(\/|$|\?)/i);
-  return m ? m[1] : null;
+  const s = String(pathname || "");
+  const m = s.match(/^\/shop\/product\/([^/?#]+)/i);
+  if (!m) return null;
+  const seg = m[1];
+  // 1) id pelado: solo dígitos
+  if (/^\d+$/.test(seg)) return seg;
+  // 2) slug-id: tomamos el último grupo de dígitos precedido por guion
+  const tail = seg.match(/-(\d+)$/);
+  if (tail) return tail[1];
+  return null;
 }
 
 module.exports = { isBot, wantsHtml, replaceTokens, matchProductId };
