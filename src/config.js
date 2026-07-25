@@ -19,6 +19,19 @@ const PROXY_LOG_LEVEL = env("PROXY_LOG_LEVEL", "warn");
 
 // Upstreams
 const SHOP_UPSTREAM = env("SHOP_UPSTREAM", "http://srv-captain--pos360-frontend");
+
+// Backoffice POS (/app/). Se separa de SHOP_UPSTREAM para poder mover SOLO la
+// tienda a otro servicio sin arrastrar el POS, que es lo que se usa en el
+// mostrador y no puede cortarse.
+//
+// Por defecto vale lo mismo que SHOP_UPSTREAM: mientras no se setee por
+// entorno, el ruteo es EXACTAMENTE el de antes.
+//
+// Los estáticos (/assets, robots, manifest) siguen en SHOP_UPSTREAM a
+// propósito: recién cuando exista el otro servicio se va a poder ver qué
+// pide cada build y decidir con datos en vez de suponer.
+const APP_UPSTREAM = env("APP_UPSTREAM", SHOP_UPSTREAM);
+
 const API_ORIGIN = env("API_ORIGIN", "http://srv-captain--pos360-commerce-api:3000");
 const API_BASE = env("API_BASE", "/api/v1");
 
@@ -81,6 +94,7 @@ module.exports = {
   PORT,
   PROXY_LOG_LEVEL,
   SHOP_UPSTREAM,
+  APP_UPSTREAM,
   API_ORIGIN,
   API_BASE,
   PUBLIC_BASE_URL,

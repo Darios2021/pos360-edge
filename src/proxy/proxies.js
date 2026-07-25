@@ -3,7 +3,14 @@
  */
 
 const { makeProxy } = require("./makeProxy");
-const { SHOP_UPSTREAM, API_ORIGIN, API_BASE, FRONTEND_INDEX_PATH, APP_INDEX_PATH } = require("../config");
+const {
+  SHOP_UPSTREAM,
+  APP_UPSTREAM,
+  API_ORIGIN,
+  API_BASE,
+  FRONTEND_INDEX_PATH,
+  APP_INDEX_PATH,
+} = require("../config");
 const { ensureSlashStart, removeTrailingSlash, joinPrefix } = require("../utils/path");
 
 const shopAssetsFirstProxy = makeProxy(SHOP_UPSTREAM, {
@@ -14,7 +21,7 @@ const shopProxy = makeProxy(SHOP_UPSTREAM, {
   pathRewrite: (p) => joinPrefix(FRONTEND_INDEX_PATH, p),
 });
 
-const appProxy = makeProxy(SHOP_UPSTREAM, {
+const appProxy = makeProxy(APP_UPSTREAM, {
   pathRewrite: (p) => joinPrefix(APP_INDEX_PATH, p),
 });
 
