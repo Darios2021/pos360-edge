@@ -9,6 +9,7 @@ const { registerOgDefaultRoute } = require("./ogDefault.route");
 const { registerRedirectRoutes } = require("./redirects.route");
 
 const faviconRoutes = require("./favicon.route");
+const { suspensionGate } = require("./suspension.route");
 
 const {
   shopAssetsFirstProxy,
@@ -57,6 +58,9 @@ function registerMounts(app) {
   app.get("/manifest.webmanifest", rootStaticProxy);
   app.get("/manifest.json", rootStaticProxy);
 
+  // ✅ Corte de acceso al backoffice ANTES del proxy: si esta suspendido,
+  // /app/ no llega al upstream. La tienda publica sigue intacta.
+  app.use("/app/", suspensionGate);
   app.use("/app/", appProxy);
   app.use("/shop/", shopProxy);
 

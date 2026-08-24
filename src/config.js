@@ -85,6 +85,32 @@ const APPLE_TOUCH_STORAGE_URL = env("APPLE_TOUCH_STORAGE_URL", FAVICON_STORAGE_U
  */
 const BRAND_ASSET_VERSION = env("BRAND_ASSET_VERSION", "");
 
+/**
+ * ✅ Suspension administrativa del backoffice (/app/)
+ *
+ * Corte de acceso decidido por nosotros, NO una falla de infraestructura: la
+ * pantalla lo dice con todas las letras. Apagado por defecto.
+ *
+ * - APP_SUSPENDIDO=1            prende el corte (pide restart)
+ * - APP_SUSPENDIDO_FILE=<path>  archivo bandera: si existe, corta. Permite
+ *                               prender y apagar en caliente, sin redeploy.
+ *
+ * Los textos y el contacto son configurables para no hardcodear datos del
+ * cliente en el repo.
+ */
+const APP_SUSPENDIDO = env("APP_SUSPENDIDO", "0") === "1";
+const APP_SUSPENDIDO_FILE = env("APP_SUSPENDIDO_FILE", "");
+
+const SUSPENSION_TITULO = env("SUSPENSION_TITULO", "Servicio suspendido");
+const SUSPENSION_MENSAJE = env(
+  "SUSPENSION_MENSAJE",
+  "El acceso al panel de gestión está suspendido temporalmente. Para reactivarlo, comunicate con el administrador del sistema."
+);
+const SUSPENSION_CONTACTO_TEXTO = env("SUSPENSION_CONTACTO_TEXTO", "");
+const SUSPENSION_CONTACTO_HREF = env("SUSPENSION_CONTACTO_HREF", "");
+const SUSPENSION_CONTACTO_BOTON = env("SUSPENSION_CONTACTO_BOTON", "Contactar");
+const SUSPENSION_RETRY_AFTER = parseInt(env("SUSPENSION_RETRY_AFTER", "3600"), 10) || 3600;
+
 function applyCoreSettings(app) {
   app.disable("x-powered-by");
   app.enable("strict routing");
@@ -114,6 +140,16 @@ module.exports = {
   FAVICON_STORAGE_URL,
   APPLE_TOUCH_STORAGE_URL,
   BRAND_ASSET_VERSION,
+
+  // ✅ Suspension del backoffice
+  APP_SUSPENDIDO,
+  APP_SUSPENDIDO_FILE,
+  SUSPENSION_TITULO,
+  SUSPENSION_MENSAJE,
+  SUSPENSION_CONTACTO_TEXTO,
+  SUSPENSION_CONTACTO_HREF,
+  SUSPENSION_CONTACTO_BOTON,
+  SUSPENSION_RETRY_AFTER,
 
   applyCoreSettings,
 
