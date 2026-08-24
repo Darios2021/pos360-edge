@@ -101,11 +101,13 @@ const BRAND_ASSET_VERSION = env("BRAND_ASSET_VERSION", "");
 const APP_SUSPENDIDO = env("APP_SUSPENDIDO", "0") === "1";
 const APP_SUSPENDIDO_FILE = env("APP_SUSPENDIDO_FILE", "");
 
-const SUSPENSION_TITULO = env("SUSPENSION_TITULO", "Servicio suspendido");
-const SUSPENSION_MENSAJE = env(
-  "SUSPENSION_MENSAJE",
-  "El acceso al panel de gestión está suspendido temporalmente. Para reactivarlo, comunicate con el administrador del sistema."
-);
+const SUSPENSION_TITULO = env("SUSPENSION_TITULO", "Servicio temporalmente no disponible");
+// Vacio a proposito: la pantalla no declara una causa. Un 503 sin explicacion
+// es la respuesta estandar de un servicio que no esta atendiendo. Si se llena,
+// que sea con algo cierto.
+const SUSPENSION_MENSAJE = env("SUSPENSION_MENSAJE", "");
+// Vacia por defecto: sin marca en la pantalla.
+const SUSPENSION_MARCA = env("SUSPENSION_MARCA", "");
 const SUSPENSION_CONTACTO_TEXTO = env("SUSPENSION_CONTACTO_TEXTO", "");
 const SUSPENSION_CONTACTO_HREF = env("SUSPENSION_CONTACTO_HREF", "");
 const SUSPENSION_CONTACTO_BOTON = env("SUSPENSION_CONTACTO_BOTON", "Contactar");
@@ -146,6 +148,7 @@ module.exports = {
   APP_SUSPENDIDO_FILE,
   SUSPENSION_TITULO,
   SUSPENSION_MENSAJE,
+  SUSPENSION_MARCA,
   SUSPENSION_CONTACTO_TEXTO,
   SUSPENSION_CONTACTO_HREF,
   SUSPENSION_CONTACTO_BOTON,

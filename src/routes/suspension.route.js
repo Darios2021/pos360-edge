@@ -24,7 +24,7 @@ const {
   SUSPENSION_CONTACTO_HREF,
   SUSPENSION_CONTACTO_BOTON,
   SUSPENSION_RETRY_AFTER,
-  OG_SITE_NAME,
+  SUSPENSION_MARCA,
 } = require("../config");
 
 function estaSuspendido() {
@@ -46,20 +46,23 @@ function escapar(s) {
 }
 
 function renderHtml() {
-  const marca = escapar(OG_SITE_NAME);
+  const marca = escapar(SUSPENSION_MARCA);
   const titulo = escapar(SUSPENSION_TITULO);
   const mensaje = escapar(SUSPENSION_MENSAJE);
   const contactoTexto = escapar(SUSPENSION_CONTACTO_TEXTO);
   const contactoHref = escapar(SUSPENSION_CONTACTO_HREF);
   const contactoBoton = escapar(SUSPENSION_CONTACTO_BOTON);
 
+  // Todo lo opcional sale de la pantalla si no esta configurado. Sin nada
+  // seteado queda un 503 pelado: titulo y codigo, sin marca y sin causa.
+  const bloqueMarca = marca ? `<p class="marca">${marca}</p>` : "";
+  const bloqueMensaje = mensaje ? `<p class="mensaje">${mensaje}</p>` : "";
+  const bloqueDato = contactoTexto ? `<p class="dato">${contactoTexto}</p>` : "";
   const bloqueContacto = contactoHref
     ? `<a class="accion" href="${contactoHref}">${contactoBoton}</a>`
     : "";
 
-  const bloqueDato = contactoTexto
-    ? `<p class="dato">${contactoTexto}</p>`
-    : "";
+  const tituloDoc = marca ? `${titulo} | ${marca}` : titulo;
 
   return `<!doctype html>
 <html lang="es">
@@ -67,15 +70,13 @@ function renderHtml() {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>${titulo} | ${marca}</title>
+<title>${tituloDoc}</title>
 <style>
   :root {
-    --navy: #121e47;
-    --celeste: #1488d1;
     --texto: #1c2333;
-    --tenue: #5b6478;
-    --linea: #dfe3ea;
-    --fondo: #eef1f5;
+    --tenue: #6b7280;
+    --linea: #e2e5ea;
+    --fondo: #f4f5f7;
   }
   * { box-sizing: border-box; }
   body {
@@ -89,97 +90,68 @@ function renderHtml() {
     color: var(--texto);
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     line-height: 1.55;
+    text-align: center;
   }
-  .tarjeta {
-    width: 100%;
-    max-width: 520px;
-    background: #fff;
-    border: 1px solid var(--linea);
-    border-radius: 14px;
-    padding: 40px 36px;
-    box-shadow: 0 1px 2px rgba(18, 30, 71, .06), 0 12px 32px rgba(18, 30, 71, .08);
+  main { max-width: 460px; }
+  .codigo {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .12em;
+    color: var(--tenue);
+    margin: 0 0 14px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 21px;
+    font-weight: 550;
+    line-height: 1.35;
   }
   .marca {
-    display: flex;
-    align-items: center;
-    gap: 10px;
+    margin: 0 0 14px;
     font-size: 13px;
     font-weight: 600;
     letter-spacing: .04em;
     text-transform: uppercase;
-    color: var(--navy);
-    margin-bottom: 28px;
-  }
-  .marca span.punto {
-    width: 10px;
-    height: 10px;
-    border-radius: 10px;
-    background: var(--celeste);
-    flex: none;
-  }
-  h1 {
-    margin: 0 0 12px;
-    font-size: 24px;
-    line-height: 1.25;
-    font-weight: 650;
-    color: var(--navy);
-  }
-  p {
-    margin: 0 0 16px;
-    font-size: 15px;
     color: var(--tenue);
   }
-  p.dato {
-    color: var(--texto);
-    font-weight: 550;
-  }
+  .mensaje, .dato { margin: 14px 0 0; font-size: 15px; color: var(--tenue); }
+  .dato { color: var(--texto); font-weight: 550; }
   .accion {
     display: inline-block;
-    margin-top: 8px;
+    margin-top: 20px;
     padding: 11px 22px;
     border-radius: 10px;
-    background: var(--celeste);
+    background: #1488d1;
     color: #fff;
     text-decoration: none;
     font-size: 15px;
     font-weight: 600;
   }
-  .accion:hover { background: #1179ba; }
-  .pie {
-    margin: 32px 0 0;
-    padding-top: 18px;
+  hr {
+    width: 40px;
+    margin: 26px auto 0;
+    border: 0;
     border-top: 1px solid var(--linea);
-    font-size: 12.5px;
-    color: var(--tenue);
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-    flex-wrap: wrap;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --texto: #e6e7eb;
-      --tenue: #a1a4ab;
-      --linea: #262a33;
-      --fondo: #14171d;
+      --tenue: #9aa0aa;
+      --linea: #2a2e37;
+      --fondo: #16181d;
     }
-    body { background: var(--fondo); }
-    .tarjeta { background: #0d0f13; box-shadow: none; }
-    h1, .marca { color: #e6e7eb; }
   }
 </style>
 </head>
 <body>
-  <main class="tarjeta">
-    <div class="marca"><span class="punto"></span>${marca}</div>
+  <main>
+    ${bloqueMarca}
+    <p class="codigo">503</p>
     <h1>${titulo}</h1>
-    <p>${mensaje}</p>
+    ${bloqueMensaje}
     ${bloqueDato}
     ${bloqueContacto}
-    <div class="pie">
-      <span>Los datos del sistema no se vieron afectados</span>
-      <span>503</span>
-    </div>
+    <hr>
   </main>
 </body>
 </html>`;
@@ -199,11 +171,9 @@ function suspensionGate(req, res, next) {
   // Las llamadas del SPA esperan JSON: devolverles HTML les rompe el parseo.
   const acepta = String(req.headers.accept || "");
   if (acepta.includes("application/json") && !acepta.includes("text/html")) {
-    return res.json({
-      ok: false,
-      error: "service_suspended",
-      mensaje: SUSPENSION_MENSAJE,
-    });
+    const cuerpo = { ok: false, error: "service_unavailable" };
+    if (SUSPENSION_MENSAJE) cuerpo.mensaje = SUSPENSION_MENSAJE;
+    return res.json(cuerpo);
   }
 
   res.type("html").send(renderHtml());
