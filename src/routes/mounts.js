@@ -20,6 +20,7 @@ const {
   apiV1CompatProxy,
   publicCompatProxy,
   apiProxy,
+  socketProxy,
 } = require("../proxy/proxies");
 
 function registerMounts(app) {
@@ -67,6 +68,7 @@ function registerMounts(app) {
   app.use("/api/v1/", apiV1CompatProxy);
   app.use("/public/", publicCompatProxy);
   app.use("/api/", apiProxy);
+  app.use("/socket.io/", socketProxy);
 }
 
 module.exports = { registerMounts };

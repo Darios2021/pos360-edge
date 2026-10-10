@@ -40,6 +40,13 @@ const apiProxy = makeProxy(API_ORIGIN, {
 });
 
 const apiV1CompatProxy = makeProxy(API_ORIGIN);
+
+// Socket.io de la API (avisos en vivo, p. ej. derivaciones). Montado en
+// /socket.io/, Express le quita el prefijo: se repone acá. Sólo transporte
+// polling; si el upgrade a websocket no pasa, el cliente sigue por polling.
+const socketProxy = makeProxy(API_ORIGIN, {
+  pathRewrite: (p) => `/socket.io${ensureSlashStart(p)}`,
+});
 const publicCompatProxy = makeProxy(API_ORIGIN);
 
 module.exports = {
@@ -51,4 +58,5 @@ module.exports = {
   apiProxy,
   apiV1CompatProxy,
   publicCompatProxy,
+  socketProxy,
 };
